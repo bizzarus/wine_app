@@ -1,10 +1,10 @@
 // Service worker: makes the app shell load instantly and offline.
 // API calls to api.anthropic.com are never cached.
-const VERSION = 'oeno-v1';
+const VERSION = 'oeno-v2';
 const SHELL = [
-  './', 'index.html', 'css/app.css', 'manifest.webmanifest',
-  'js/app.js', 'js/claude.js', 'js/db.js', 'js/demo.js', 'js/image.js', 'js/pipeline.js', 'js/prompts.js', 'js/scoring.js',
-  'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
+  './', 'index.html', 'app.css', 'manifest.webmanifest',
+  'app.js', 'claude.js', 'db.js', 'demo.js', 'image.js', 'pipeline.js', 'prompts.js', 'scoring.js',
+  'icon-192.png', 'icon-512.png', 'apple-touch-icon.png',
 ];
 
 self.addEventListener('install', (e) => {
