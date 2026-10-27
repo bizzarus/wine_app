@@ -59,12 +59,15 @@ export async function extract(photos, settings, signal) {
   return { bottles, storeHint: json.store_hint || null, usage: res.usage };
 }
 
+// The search location only biases results. Romania ("RO") is not an accepted country code,
+// so we send none by default; the prompt already names Romanian shops to search.
+// If a location is ever rejected, it is dropped automatically and the search retried.
+let useLocation = false;
+const LOCATION = { type: 'approximate', timezone: 'Europe/Bucharest' };
+
 function searchTool(variant, maxUses) {
-  const base = {
-    name: 'web_search',
-    max_uses: maxUses,
-    user_location: { type: 'approximate', country: 'RO', city: 'Bucharest', timezone: 'Europe/Bucharest' },
-  };
+  const base = { name: 'web_search', max_uses: maxUses };
+  if (useLocation) base.user_location = LOCATION;
   if (variant === 'dynamic') return { type: 'web_search_20260318', ...base, response_inclusion: 'excluded' };
   if (variant === 'direct') return { type: 'web_search_20260318', ...base, allowed_callers: ['direct'] };
   return { type: 'web_search_20250305', ...base };
@@ -89,8 +92,12 @@ async function lookupBatch(items, settings, signal) {
       const json = extractJson(res.text);
       return { wines: json.wines || [], citations: res.citations, usage: res.usage };
     } catch (e) {
-      const toolProblem = e instanceof ClaudeError && e.status === 400 && /tool|caller|web_search|code_execution/i.test(e.message);
-      if (toolProblem && v < variants.length - 1) continue;
+      if (!(e instanceof ClaudeError) || e.status !== 400) throw e;
+      // Location rejected: drop it and retry the same tool version.
+      if (useLocation && /country|location|region|city|timezone/i.test(e.message)) { useLocation = false; v--; continue; }
+      // Only a tool-version / caller problem justifies falling back to an older search tool.
+      const versionProblem = /allowed_callers|caller|code_execution|response_inclusion|unknown tool|tool type|not supported for this model|does not support/i.test(e.message);
+      if (versionProblem && v < variants.length - 1) continue;
       throw e;
     }
   }

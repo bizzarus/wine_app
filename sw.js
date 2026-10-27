@@ -1,6 +1,6 @@
 // Service worker: makes the app shell load instantly and offline.
 // API calls to api.anthropic.com are never cached.
-const VERSION = 'oeno-v2';
+const VERSION = 'oeno-v3';
 const SHELL = [
   './', 'index.html', 'app.css', 'manifest.webmanifest',
   'app.js', 'claude.js', 'db.js', 'demo.js', 'image.js', 'pipeline.js', 'prompts.js', 'scoring.js',
