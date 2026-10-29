@@ -240,16 +240,45 @@ a { color: var(--glass-3); }
 .shelf-view .box .lbl { position: absolute; top: -2px; left: -2px; background: var(--tag); color: var(--tag-ink); font-weight: 800; font-size: 13px; padding: 1px 7px; border-radius: 0 0 6px 0; }
 
 /* ---------- sheet ---------- */
-.sheet-backdrop { position: fixed; inset: 0; background: rgba(10,20,17,.55); z-index: 20; display: flex; align-items: flex-end; }
-.sheet {
-  background: var(--paper); width: 100%; max-height: 92vh; overflow-y: auto;
-  border-radius: 22px 22px 0 0; padding: 10px 18px calc(24px + var(--safe-b));
-  animation: up .22s ease-out;
+body.sheet-open { overflow: hidden; }
+.sheet-backdrop {
+  position: fixed; inset: 0; background: rgba(10,20,17,.55); z-index: 20;
+  display: flex; align-items: flex-end; animation: fade .2s ease-out;
 }
-@keyframes up { from { transform: translateY(40px); opacity: .6; } }
-@media (prefers-reduced-motion: reduce) { .sheet { animation: none; } }
-.sheet .grab { width: 40px; height: 5px; border-radius: 3px; background: var(--line); margin: 0 auto 14px; }
-.sheet h3 { font-size: 22px; margin: 0 0 4px; font-weight: 800; font-stretch: 104%; }
+.sheet-backdrop.leaving { opacity: 0; transition: opacity .22s ease-in; }
+@keyframes fade { from { opacity: 0; } }
+.sheet {
+  background: var(--paper); width: 100%;
+  /* always leave a strip of backdrop visible at the top */
+  max-height: calc(100vh - 64px - var(--safe-t));
+  max-height: calc(100dvh - 64px - var(--safe-t));
+  display: flex; flex-direction: column;
+  border-radius: 22px 22px 0 0; outline: none;
+  animation: up .24s ease-out; will-change: transform;
+}
+@keyframes up { from { transform: translateY(100%); } }
+@media (prefers-reduced-motion: reduce) { .sheet, .sheet-backdrop { animation: none; } }
+.sheet-head {
+  position: relative; flex: 0 0 auto; height: 52px;
+  display: flex; align-items: center; justify-content: center;
+  touch-action: none; /* the header is a drag handle, never a scroll area */
+}
+.grab-zone {
+  position: absolute; inset: 0; width: 100%; border: 0; background: transparent; cursor: pointer;
+  display: flex; align-items: flex-start; justify-content: center; padding-top: 10px;
+}
+.grab { width: 44px; height: 5px; border-radius: 3px; background: #a8b5ab; display: block; }
+.sheet-x {
+  position: absolute; top: 8px; right: 12px; width: 40px; height: 40px; border-radius: 20px;
+  border: 0; background: var(--paper-2); color: var(--ink); cursor: pointer;
+  display: grid; place-items: center;
+}
+.sheet-x svg { width: 20px; height: 20px; }
+.sheet-body {
+  flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+  padding: 0 18px calc(24px + var(--safe-b));
+}
+.sheet h3 { font-size: 22px; margin: 0 0 4px; font-weight: 800; font-stretch: 104%; padding-right: 36px; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 15px; margin: 14px 0; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; font-weight: 600; }

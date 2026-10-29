@@ -413,11 +413,91 @@ function render() {
 
 /* ------------------------------------------------------------------ sheets */
 
+// Bottom sheet. Three ways to close it besides the backdrop:
+//  - the close button (top right, stays visible while the content scrolls)
+//  - a tap on the handle bar at the top
+//  - a swipe down: always from the header; from the content when it is scrolled to the top
+let sheetTimer = null;
+const reduceMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
 function openSheet(html) {
-  $sheet.innerHTML = `<div class="sheet-backdrop" data-action="close-sheet"><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div></div>`;
-  $sheet.querySelector('.sheet').focus?.();
+  clearTimeout(sheetTimer);
+  $sheet.innerHTML = `<div class="sheet-backdrop" data-action="close-sheet">
+    <div class="sheet" role="dialog" aria-modal="true" tabindex="-1">
+      <div class="sheet-head">
+        <button class="grab-zone" data-action="dismiss-sheet" aria-label="Close"><span class="grab"></span></button>
+        <button class="sheet-x" data-action="dismiss-sheet" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <div class="sheet-body">${html}</div>
+    </div></div>`;
+  document.body.classList.add('sheet-open');
+  const sheet = $sheet.querySelector('.sheet');
+  sheet.focus({ preventScroll: true });
+  enableSwipe(sheet);
 }
-function closeSheet() { $sheet.innerHTML = ''; }
+
+/** Immediate close (used before opening another sheet or changing screen). */
+function closeSheet() {
+  clearTimeout(sheetTimer);
+  $sheet.innerHTML = '';
+  document.body.classList.remove('sheet-open');
+}
+
+/** User-initiated close: slide down, then remove. */
+function dismissSheet() {
+  const sheet = $sheet.querySelector('.sheet');
+  if (!sheet || reduceMotion()) return closeSheet();
+  sheet.style.transition = 'transform .22s ease-in';
+  sheet.style.transform = 'translateY(100%)';
+  $sheet.querySelector('.sheet-backdrop').classList.add('leaving');
+  clearTimeout(sheetTimer);
+  sheetTimer = setTimeout(closeSheet, 220);
+}
+
+function enableSwipe(sheet) {
+  const body = sheet.querySelector('.sheet-body');
+  const head = sheet.querySelector('.sheet-head');
+  let startY = 0, startT = 0, dy = 0, dragging = false, decided = false, fromHead = false;
+
+  sheet.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    startY = e.touches[0].clientY;
+    startT = Date.now();
+    dy = 0; dragging = false; decided = false;
+    fromHead = head.contains(e.target);
+  }, { passive: true });
+
+  sheet.addEventListener('touchmove', (e) => {
+    const d = e.touches[0].clientY - startY;
+    if (!decided) {
+      if (Math.abs(d) < 6) return;
+      decided = true;
+      // Drag the sheet only when pulling down from the header, or from content already at its top.
+      dragging = d > 0 && (fromHead || body.scrollTop <= 0);
+      if (dragging) sheet.style.transition = 'none';
+    }
+    if (!dragging) return;
+    e.preventDefault(); // stop the content from scrolling / rubber-banding while dragging
+    dy = Math.max(0, d);
+    sheet.style.transform = `translateY(${dy}px)`;
+  }, { passive: false });
+
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    const velocity = dy / Math.max(1, Date.now() - startT); // px per ms
+    if (dy > Math.min(140, sheet.offsetHeight * 0.25) || (velocity > 0.5 && dy > 30)) {
+      dismissSheet();
+    } else {
+      sheet.style.transition = 'transform .2s ease-out';
+      sheet.style.transform = '';
+    }
+  };
+  sheet.addEventListener('touchend', end);
+  sheet.addEventListener('touchcancel', end);
+}
 
 function photoFor(b) {
   const p = S.photos[b.photo] || S.photos[0];
@@ -716,7 +796,8 @@ const actions = {
     closeSheet(); render(); toast('Removed from your wine list');
   },
   fix: (el) => fixSheet(+el.dataset.idx),
-  'close-sheet': (el, ev) => { if (ev.target === el) closeSheet(); },
+  'close-sheet': (el, ev) => { if (ev.target === el) dismissSheet(); },
+  'dismiss-sheet': () => dismissSheet(),
   'open-scan': (el) => openScan(+el.dataset.id),
   'test-key': async (el) => {
     if (!settings.apiKey) return toast('Paste your API key first');
@@ -747,7 +828,7 @@ document.addEventListener('click', (ev) => {
   const fn = actions[el.dataset.action];
   if (!fn) return;
   if (el.dataset.action !== 'close-sheet') ev.preventDefault();
-  if (el.closest('.sheet') && el.dataset.action !== 'close-sheet' && !['forget-wine', 'fix'].includes(el.dataset.action)) closeSheet();
+  if (el.closest('.sheet') && !['close-sheet', 'dismiss-sheet', 'forget-wine', 'fix'].includes(el.dataset.action)) closeSheet();
   if (el.dataset.action === 'fix') closeSheet();
   fn(el, ev);
 });
@@ -798,7 +879,7 @@ document.addEventListener('submit', async (ev) => {
   runLookup([wineKey(b)]);
 });
 
-document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeSheet(); });
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && $sheet.firstChild) dismissSheet(); });
 
 /* ------------------------------------------------------------------ boot */
 
