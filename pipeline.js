@@ -1,14 +1,26 @@
 // Orchestration: photo(s) → bottles → filtered candidates → cached/web lookup.
 
 import { ask, ClaudeError } from './claude.js';
-import { EXTRACT_SYSTEM, extractUserText, LOOKUP_SYSTEM, lookupUserText } from './prompts.js';
+import {
+  EXTRACT_SYSTEM, extractUserText, LOOKUP_SYSTEM, lookupUserText,
+  EXTRACT_MENU_SYSTEM, extractMenuUserText, LOOKUP_HORECA_SYSTEM, lookupHorecaUserText,
+} from './prompts.js';
 import { extractJson, wineKey, COLORS } from './scoring.js';
 import * as db from './db.js';
+
+/**
+ * Saved lookups are kept per domain: a restaurant lookup (restaurant prices) must never
+ * be reused as a shop lookup (retail prices) or the other way round.
+ * Retail keeps the original bare key, so data saved before restaurant mode still works.
+ */
+export const dbKey = (k, domain) => (domain === 'horeca' ? `horeca|${k}` : k);
 
 const num = (x) => (typeof x === 'number' && isFinite(x) ? x : typeof x === 'string' && x.trim() !== '' && isFinite(+x.replace(',', '.')) ? +x.replace(',', '.') : null);
 
 function cleanBottle(b, i) {
   const color = COLORS.includes(b.color) ? b.color : 'unknown';
+  // Wine lists use bottle_price; shelves use shelf_price. Both end up in shelf_price.
+  const bottle = num(b.shelf_price) ?? num(b.bottle_price);
   let bbox = Array.isArray(b.bbox) && b.bbox.length === 4 ? b.bbox.map(Number) : null;
   if (bbox && bbox.some((v) => !isFinite(v))) bbox = null;
   return {
@@ -23,9 +35,12 @@ function cleanBottle(b, i) {
     color,
     sweetness: b.sweetness || null,
     volume_ml: num(b.volume_ml),
-    shelf_price: num(b.shelf_price),
+    shelf_price: bottle,
     promo_price: num(b.promo_price),
-    price_tag_text: b.price_tag_text || null,
+    glass_price: num(b.glass_price),
+    glass_ml: num(b.glass_ml),
+    section: b.section || null,
+    price_tag_text: b.price_tag_text || b.line_text || null,
     facings: Number.isInteger(b.facings) ? b.facings : 1,
     bbox,
     confidence: Math.max(0, Math.min(1, num(b.confidence) ?? 0.5)),
@@ -37,18 +52,19 @@ export function label(b) {
   return main || (b.grapes?.length ? b.grapes.join(' / ') : 'Unidentified wine');
 }
 
-/** Step 3: read the shelf. */
-export async function extract(photos, settings, signal) {
+/** Step 3: read the shelf (retail) or the wine list (horeca). */
+export async function extract(photos, settings, signal, domain = 'retail') {
+  const menu = domain === 'horeca';
   const content = [];
   photos.forEach((p, i) => {
     if (photos.length > 1) content.push({ type: 'text', text: `Photo ${i}:` });
     content.push({ type: 'image', source: { type: 'base64', media_type: p.mediaType, data: p.base64 } });
   });
-  content.push({ type: 'text', text: extractUserText(photos.length) });
+  content.push({ type: 'text', text: (menu ? extractMenuUserText : extractUserText)(photos.length) });
 
   const res = await ask(settings.apiKey, {
     model: settings.visionModel,
-    system: EXTRACT_SYSTEM,
+    system: menu ? EXTRACT_MENU_SYSTEM : EXTRACT_SYSTEM,
     content,
     effort: settings.visionEffort,
     maxTokens: 24000,
@@ -56,7 +72,8 @@ export async function extract(photos, settings, signal) {
   });
   const json = extractJson(res.text);
   const bottles = (json.bottles || []).map(cleanBottle);
-  return { bottles, storeHint: json.store_hint || null, usage: res.usage };
+  const photoKind = ['shelf', 'menu', 'other'].includes(json.photo_kind) ? json.photo_kind : null;
+  return { bottles, storeHint: json.venue_hint || json.store_hint || null, photoKind, usage: res.usage };
 }
 
 // The search location only biases results. Romania ("RO") is not an accepted country code,
@@ -75,15 +92,16 @@ function searchTool(variant, maxUses) {
 
 let toolVariant = 'dynamic'; // downgraded automatically if the model/account rejects it
 
-async function lookupBatch(items, settings, signal) {
+async function lookupBatch(items, settings, signal, domain) {
+  const horeca = domain === 'horeca';
   const variants = ['dynamic', 'direct', 'basic'];
   for (let v = variants.indexOf(toolVariant); v < variants.length; v++) {
     try {
       const res = await ask(settings.apiKey, {
         model: settings.lookupModel,
-        system: LOOKUP_SYSTEM,
-        content: [{ type: 'text', text: lookupUserText(items) }],
-        tools: [searchTool(variants[v], Math.min(20, items.length * 3 + 2))],
+        system: horeca ? LOOKUP_HORECA_SYSTEM : LOOKUP_SYSTEM,
+        content: [{ type: 'text', text: (horeca ? lookupHorecaUserText : lookupUserText)(items) }],
+        tools: [searchTool(variants[v], Math.min(24, items.length * (horeca ? 4 : 3) + 2))],
         effort: settings.lookupEffort,
         maxTokens: 16000,
         signal,
@@ -103,11 +121,29 @@ async function lookupBatch(items, settings, signal) {
   }
 }
 
-function cleanInfo(w) {
+const httpUrl = (u) => (typeof u === 'string' && /^https?:\/\//.test(u) ? u : null);
+
+function cleanInfo(w, domain) {
   const sources = Array.isArray(w.sources)
-    ? w.sources.filter((s) => s && /^https?:\/\//.test(s.url)).slice(0, 6)
+    ? w.sources.filter((s) => s && httpUrl(s.url)).slice(0, 6)
     : [];
+  const horeca = domain === 'horeca' ? {
+    horeca_price_ron: num(w.horeca_price_ron),
+    horeca_price_low_ron: num(w.horeca_price_low_ron),
+    horeca_price_high_ron: num(w.horeca_price_high_ron),
+    horeca_sample_count: num(w.horeca_sample_count),
+    horeca_examples: Array.isArray(w.horeca_examples)
+      ? w.horeca_examples.filter((e) => e && e.venue && num(e.price_ron)).slice(0, 6).map((e) => ({
+        venue: String(e.venue), city: e.city || null, price_ron: num(e.price_ron), url: httpUrl(e.url), note: e.note || null,
+      }))
+      : [],
+  } : {};
+  if (domain === 'horeca' && horeca.horeca_price_ron && !horeca.horeca_sample_count) {
+    horeca.horeca_sample_count = horeca.horeca_examples.length || null;
+  }
   return {
+    domain: domain || 'retail',
+    ...horeca,
     matched_name: w.matched_name || null,
     rating: num(w.rating) != null && num(w.rating) <= 5 ? num(w.rating) : null,
     rating_count: num(w.rating_count),
@@ -130,7 +166,7 @@ function cleanInfo(w) {
  * Step 4–5: get info for each candidate from the local DB, else from the web.
  * onProgress({ key, state: 'cached'|'searching'|'done'|'failed', info })
  */
-export async function lookup(candidates, settings, onProgress, signal) {
+export async function lookup(candidates, settings, onProgress, signal, domain = 'retail') {
   const usage = { input_tokens: 0, output_tokens: 0, web_search_requests: 0 };
   const infoByKey = {};
   const ttl = settings.cacheDays * 864e5;
@@ -145,7 +181,7 @@ export async function lookup(candidates, settings, onProgress, signal) {
 
   const toFetch = [];
   for (const [k, b] of unique) {
-    const hit = await db.getWine(k);
+    const hit = await db.getWine(dbKey(k, domain));
     if (hit && Date.now() - hit.fetchedAt < ttl && !settings.forceRefresh) {
       infoByKey[k] = hit.info;
       onProgress?.({ key: k, state: 'cached', info: hit.info });
@@ -166,16 +202,16 @@ export async function lookup(candidates, settings, onProgress, signal) {
       const items = batch.map(([k, b], j) => ({ ...b, _id: `w${j}`, _key: k }));
       items.forEach((it) => onProgress?.({ key: it._key, state: 'searching' }));
       try {
-        const r = await lookupBatch(items, settings, signal);
+        const r = await lookupBatch(items, settings, signal, domain);
         usage.input_tokens += r.usage.input_tokens;
         usage.output_tokens += r.usage.output_tokens;
         usage.web_search_requests += r.usage.web_search_requests;
         for (const it of items) {
           const w = r.wines.find((x) => x.id === it._id);
           if (!w) { onProgress?.({ key: it._key, state: 'failed' }); continue; }
-          const info = { ...cleanInfo(w), citations: r.citations.slice(0, 10) };
+          const info = { ...cleanInfo(w, domain), citations: r.citations.slice(0, 10) };
           infoByKey[it._key] = info;
-          await db.putWine(it._key, info, label(it));
+          await db.putWine(dbKey(it._key, domain), info, label(it), { domain, wineKey: it._key });
           onProgress?.({ key: it._key, state: 'done', info });
         }
       } catch (e) {

@@ -2,6 +2,10 @@
 
 export const COLORS = ['red', 'white', 'rose', 'sparkling', 'dessert', 'fortified', 'orange', 'unknown'];
 
+/** Two price domains that are never compared with each other. */
+export const DOMAINS = ['retail', 'horeca'];
+const isNum = (x) => typeof x === 'number' && isFinite(x) && x > 0;
+
 const clamp = (x, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, x));
 
 /** Normalise a wine identity into a stable cache key. */
@@ -16,13 +20,22 @@ export function wineKey(w) {
   return `${norm(w.producer)}|${norm(w.name)}|${vintage}`;
 }
 
-/** Price the customer actually pays on the shelf (promo wins). */
+/**
+ * Price the customer actually pays (promo wins), normalised to a 750 ml bottle.
+ * Wine lists may give only a glass price: it is then converted to a bottle equivalent
+ * (glass price × 750 / glass ml, 150 ml if not stated) and flagged byGlass.
+ */
 export function effectiveShelfPrice(b) {
-  const p = [b.promo_price, b.shelf_price].find((x) => typeof x === 'number' && x > 0);
-  if (p == null) return null;
-  // Normalise to 750 ml so magnums / 375 ml don't distort value.
-  const vol = typeof b.volume_ml === 'number' && b.volume_ml > 0 ? b.volume_ml : 750;
-  return { price: p, per750: (p * 750) / vol };
+  const p = [b.promo_price, b.shelf_price].find(isNum);
+  if (p != null) {
+    const vol = isNum(b.volume_ml) ? b.volume_ml : 750;
+    return { price: p, per750: (p * 750) / vol, byGlass: false };
+  }
+  if (isNum(b.glass_price)) {
+    const ml = isNum(b.glass_ml) ? b.glass_ml : 150;
+    return { price: b.glass_price, per750: (b.glass_price * 750) / ml, byGlass: true, glassMl: ml };
+  }
+  return null;
 }
 
 /** Matches the type preference. "other" covers dessert/fortified/orange/unknown. */
@@ -40,19 +53,28 @@ export function filterCandidates(bottles, prefs) {
     if (!matchesType(b.color, types)) return false;
     const sp = effectiveShelfPrice(b);
     if (!sp) return !!includeUnpriced;
-    if (minPrice != null && sp.price < minPrice) return false;
-    if (maxPrice != null && sp.price > maxPrice) return false;
+    // Budget is per bottle: glass-only wines are filtered on their bottle equivalent.
+    const cmp = sp.byGlass ? sp.per750 : sp.price;
+    if (minPrice != null && cmp < minPrice) return false;
+    if (maxPrice != null && cmp > maxPrice) return false;
     return true;
   });
 }
 
 /**
- * Market reference price in RON for a 750 ml bottle.
- * Local Romanian retail (if found) is more relevant than international averages,
- * so it wins; otherwise the international average in EUR is converted.
+ * Market reference price in RON for a 750 ml bottle, within ONE domain.
+ * retail: Romanian online retail (if found) wins over the international average in EUR.
+ * horeca: only what other restaurants charge. Retail prices are never used here,
+ *         so a restaurant is judged only against restaurants.
  */
-export function marketReferenceRon(info, rates) {
+export function marketReferenceRon(info, rates, domain = 'retail') {
   if (!info) return null;
+  if (domain === 'horeca') {
+    if (isNum(info.horeca_price_ron)) {
+      return { value: info.horeca_price_ron, basis: 'typical restaurant price', n: info.horeca_sample_count ?? null };
+    }
+    return null;
+  }
   if (typeof info.local_price_ron === 'number' && info.local_price_ron > 0) {
     return { value: info.local_price_ron, basis: 'Romanian online retail' };
   }
@@ -94,9 +116,9 @@ export const PRIORITY_WEIGHTS = {
   quality: { v: 0.2, q: 0.8 },
 };
 
-export function scoreWine(bottle, info, prefs, rates) {
+export function scoreWine(bottle, info, prefs, rates, domain = 'retail') {
   const sp = effectiveShelfPrice(bottle);
-  const market = marketReferenceRon(info, rates);
+  const market = marketReferenceRon(info, rates, domain);
   const ratio = sp && market ? market.value / sp.per750 : null;
   const v = valueScore(ratio);
   const { q, known } = qualityScore(info);
@@ -119,7 +141,9 @@ export function scoreWine(bottle, info, prefs, rates) {
     qualityScore: known ? q : null,
     market,
     shelf: sp,
+    domain,
     flags: {
+      byGlass: !!sp?.byGlass,
       noMarket: !market,
       noRating: !known,
       lowConfidence: Math.min(idConf, matchConf) < 0.5,
@@ -128,10 +152,10 @@ export function scoreWine(bottle, info, prefs, rates) {
 }
 
 /** Rank and return the top N distinct wines. */
-export function recommend(bottles, infoByKey, prefs, rates, n = 3) {
+export function recommend(bottles, infoByKey, prefs, rates, n = 3, domain = 'retail') {
   const scored = bottles.map((b) => {
     const info = infoByKey[wineKey(b)] || null;
-    return { bottle: b, info, ...scoreWine(b, info, prefs, rates) };
+    return { bottle: b, info, ...scoreWine(b, info, prefs, rates, domain) };
   });
   scored.sort((a, b) => b.score - a.score);
   const seen = new Set();
@@ -149,13 +173,21 @@ export function recommend(bottles, infoByKey, prefs, rates, n = 3) {
 /** Plain-language reasons for a pick. */
 export function reasons(s, fmt = (x) => x.toFixed(0)) {
   const out = [];
+  const horeca = s.domain === 'horeca';
   if (s.ratio != null && s.market) {
     const pct = Math.round((1 - 1 / s.ratio) * 100);
-    if (pct >= 5) out.push(`${pct}% below its usual price (about ${fmt(s.market.value)} lei, ${s.market.basis})`);
-    else if (pct <= -5) out.push(`${-pct}% above its usual price (about ${fmt(s.market.value)} lei)`);
-    else out.push(`Priced in line with the market (about ${fmt(s.market.value)} lei)`);
+    const ref = horeca
+      ? `about ${fmt(s.market.value)} lei${s.market.n ? ` across ${s.market.n} restaurant${s.market.n === 1 ? '' : 's'}` : ' in other restaurants'}`
+      : `about ${fmt(s.market.value)} lei, ${s.market.basis}`;
+    const usual = horeca ? 'what restaurants usually charge' : 'its usual price';
+    if (pct >= 5) out.push(`${pct}% below ${usual} (${ref})`);
+    else if (pct <= -5) out.push(`${-pct}% above ${usual} (${ref})`);
+    else out.push(horeca ? `A fair restaurant price (${ref})` : `Priced in line with the market (${ref})`);
   } else {
-    out.push('No reliable market price found');
+    out.push(horeca ? 'No prices from other restaurants found, so price fairness is unknown' : 'No reliable market price found');
+  }
+  if (s.flags?.byGlass && s.shelf) {
+    out.push(`Listed by the glass (${s.shelf.glassMl} ml), compared as about ${fmt(s.shelf.per750)} lei per bottle`);
   }
   const i = s.info || {};
   if (typeof i.rating === 'number') {

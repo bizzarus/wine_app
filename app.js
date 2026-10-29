@@ -1,12 +1,17 @@
-// Oeno — pick a wine from the supermarket shelf.
+// Oeno — pick a wine from a supermarket shelf or a restaurant wine list.
 // UI controller: screens are pure render functions; events use data-action delegation.
+//
+// Two separate price domains:
+//   retail  — supermarket / shop shelf, compared with shop prices
+//   horeca  — restaurant / bar wine list, compared ONLY with other restaurants' prices
 
 import * as db from './db.js';
 import { prepare } from './image.js';
-import { extract, lookup, label } from './pipeline.js';
+import { extract, lookup, label, dbKey } from './pipeline.js';
 import { testKey, estimateCost } from './claude.js';
 import { filterCandidates, recommend, reasons, wineKey, effectiveShelfPrice, scoreWine } from './scoring.js';
-import { demoShelfDataUrl, demoBottles, demoInfo } from './demo.js';
+import { demoShelfDataUrl, demoBottles, demoInfo, demoMenuDataUrl, demoMenuBottles, demoMenuInfo } from './demo.js';
+import { currentPosition, exifGps, nearbyPlaces, autoChoose, distanceM, namePlaceId, KIND_LABEL } from './geo.js';
 
 /* ------------------------------------------------------------------ settings */
 
@@ -26,8 +31,44 @@ const DEFAULTS = {
   cacheDays: 30,
   eurRon: 5.35,
   includeUnpriced: false,
+  saveLocation: true,
   lastPrefs: { types: ['red'], minPrice: null, maxPrice: null, priority: 'balanced' },
+  lastPrefsHoreca: { types: ['red'], minPrice: null, maxPrice: null, priority: 'balanced' },
 };
+
+/* ------------------------------------------------------------------ wording per domain */
+
+const COPY = {
+  retail: {
+    noun: 'shelf', title: 'Your shelf', read: 'Read the shelf', reading: 'Reading labels and price tags…',
+    found: 'wines found', priceOn: 'Price on the shelf', every: 'Everything on the shelf', show: 'Show on shelf',
+    priceLabel: 'Shelf price', vs: 'vs usual', vsCol: 'vs usual', missing: 'usual price<br>not found',
+    demo: 'Demo shelf, fictional wines', add: 'Add another section', on: 'on this shelf',
+    prio: 'Biggest gap between its usual price and this shelf',
+    searching: 'Searching ratings and prices…', done: 'Ratings and prices found',
+    none: 'No wine bottles were recognised. Step a little closer and make sure labels are in focus.',
+    noMatch: 'No wines on this shelf match. Try a wider price range or another type.',
+    tips: ['Hold the phone straight, about one step back, so labels and price tags are both readable.', 'For a long shelf, take one photo per section. Overlap is fine.'],
+    presets: [[null, 30, 'Under 30'], [30, 60, '30–60'], [60, 100, '60–100'], [100, null, '100+'], [null, null, 'Any price']],
+    where: 'Looking for the shop…', placeWord: 'shop', placeHolder: 'Shop name, e.g. Kaufland Pipera', badge: 'Shop',
+  },
+  horeca: {
+    noun: 'wine list', title: 'Your wine list', read: 'Read the wine list', reading: 'Reading the wine list…',
+    found: 'wines on the list', priceOn: 'Price per bottle', every: 'Everything on the list', show: 'Show on menu',
+    priceLabel: 'List price', vs: 'vs other restaurants', vsCol: 'vs rest.', missing: 'no restaurant<br>prices found',
+    demo: 'Demo wine list, fictional wines', add: 'Add another page', on: 'on this list',
+    prio: 'Cheapest compared with what other restaurants charge',
+    searching: 'Searching ratings and restaurant prices…', done: 'Ratings and restaurant prices found',
+    none: 'No wines were recognised on the list. Hold the phone flat above the page and avoid glare.',
+    noMatch: 'No wines on this list match. Try a wider price range or another type.',
+    tips: ['Hold the phone flat above the page so the whole page is in the frame. Avoid glare from lamps.', 'Take one photo per page of the wine list.'],
+    presets: [[null, 100, 'Under 100'], [100, 200, '100–200'], [200, 350, '200–350'], [350, null, '350+'], [null, null, 'Any price']],
+    where: 'Looking for the restaurant…', placeWord: 'restaurant', placeHolder: 'Restaurant name', badge: 'Restaurant',
+  },
+};
+const C = () => COPY[S.domain] || COPY.retail;
+const prefsKey = (domain) => (domain === 'horeca' ? 'lastPrefsHoreca' : 'lastPrefs');
+const rates = () => ({ EUR: settings.eurRon });
 
 function loadSettings() {
   try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('oeno.settings') || '{}') }; }
@@ -40,10 +81,15 @@ let settings = loadSettings();
 
 /* ------------------------------------------------------------------ state */
 
-const fresh = () => ({
+const freshGeo = () => ({ status: 'idle', pos: null, candidates: [], place: null, chosenBy: null, osmError: false });
+
+const fresh = (domain = 'retail') => ({
+  domain,
   photos: [],
-  extraction: { status: 'idle', bottles: [], storeHint: null, error: null, usage: null },
-  prefs: structuredClone(settings.lastPrefs),
+  extraction: { status: 'idle', bottles: [], storeHint: null, photoKind: null, error: null, usage: null },
+  prefs: structuredClone(settings[prefsKey(domain)] || DEFAULTS[prefsKey(domain)]),
+  geo: freshGeo(),
+  scanId: null,
   prefsSubmitted: false,
   lookup: { status: 'idle', progress: {}, infoByKey: {}, usage: null, error: null, capped: null, failed: 0 },
   results: null,
@@ -54,9 +100,9 @@ const fresh = () => ({
 
 let screen = 'home';
 let S = fresh();
-let homeStats = { wines: 0, scans: 0 };
+let homeStats = { wines: 0, scans: 0, places: 0 };
 let historyTab = 'scans';
-let historyData = { scans: [], wines: [] };
+let historyData = { scans: [], wines: [], places: [] };
 let sortBy = 'score';
 
 /* ------------------------------------------------------------------ helpers */
@@ -82,7 +128,11 @@ const ICON = {
   db: '<svg viewBox="0 0 24 24" fill="none" stroke="#5b6c66" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>',
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="#c4303a" stroke-width="3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   dot: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="#c9d3c8"/></svg>',
+  pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>',
+  menu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 8h5M8 12h8M8 16h6"/></svg>',
+  tick: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 7"/></svg>',
 };
+const badge = (domain) => `<span class="badge ${domain === 'horeca' ? 'horeca' : 'retail'}">${COPY[domain === 'horeca' ? 'horeca' : 'retail'].badge}</span>`;
 
 function toast(msg, ms = 2600) {
   const t = document.getElementById('toast');
@@ -112,74 +162,88 @@ function viewHome() {
   const needsKey = !settings.apiKey;
   const bottleColors = ['var(--red)', 'var(--white)', 'var(--red)', 'var(--sparkling)', 'var(--rose)', 'var(--white)', 'var(--red)', 'var(--sparkling)'];
   const heights = [74, 66, 80, 70, 62, 76, 68, 72];
-  return `${topBar('Oeno', 'Pick a wine from the shelf', {
+  return `${topBar('Oeno', 'Pick a wine in the shop or at the restaurant', {
     right: `<button class="icon-btn" data-action="history" aria-label="Your wines and past scans">${ICON.book}</button>
             <button class="icon-btn" data-action="settings" aria-label="Settings">${ICON.gear}</button>`,
   })}
   <main class="page">
-    ${needsKey ? `<div class="notice">Add your Anthropic API key in <button class="link-btn" data-action="settings">Settings</button> to scan real shelves. You can try the demo shelf now.</div>` : ''}
-    <button class="hero-scan" data-action="${needsKey ? 'settings' : 'take-photo'}">
+    ${needsKey ? `<div class="notice">Add your Anthropic API key in <button class="link-btn" data-action="settings">Settings</button> to scan real shelves and wine lists. You can try the demos now.</div>` : ''}
+    <button class="hero-scan" data-action="${needsKey ? 'settings' : 'take-photo'}" data-domain="retail">
       <div class="bottles" aria-hidden="true">${heights.map((h, i) => `<i style="height:${h}px;background:${bottleColors[i]}"></i>`).join('')}</div>
       <div class="shelf-edge" aria-hidden="true"></div>
       <strong>Scan the shelf</strong>
-      <span>Take a photo of the wines in front of you</span>
+      <span>In a shop: photograph the wines and price tags</span>
+    </button>
+    <button class="hero-scan menu" data-action="${needsKey ? 'settings' : 'take-photo'}" data-domain="horeca">
+      <div class="menu-lines" aria-hidden="true">
+        <i><b style="width:62%"></b><u></u><em>145</em></i>
+        <i><b style="width:48%"></b><u></u><em>260</em></i>
+        <i><b style="width:70%"></b><u></u><em>95</em></i>
+      </div>
+      <strong>Scan a wine list</strong>
+      <span>At a restaurant: compared only with restaurant prices</span>
     </button>
     <div class="stats">
-      <div><b>${homeStats.wines}</b>wines in your list</div>
-      <div><b>${homeStats.scans}</b>shelves scanned</div>
+      <div><b>${homeStats.wines}</b>wines saved</div>
+      <div><b>${homeStats.scans}</b>scans</div>
+      <div><b>${homeStats.places}</b>places</div>
     </div>
-    <h2 class="section-title">How it works</h2>
-    <ol class="tips">
-      <li>Photograph the shelf, price tags included. Add more photos for a long shelf.</li>
-      <li>Choose type, price range and what matters most while the photo is read.</li>
-      <li>Get 2–3 picks with ratings, usual price and where they are on the shelf.</li>
-    </ol>
-    <p style="display:flex;gap:22px;flex-wrap:wrap">
-      ${needsKey ? '' : '<button class="link-btn" data-action="pick-photo">Use a photo you already took</button>'}
-      <button class="link-btn" data-action="demo">Try the demo shelf</button>
+    <h2 class="section-title">Use a photo you already took</h2>
+    <p style="display:flex;gap:22px;flex-wrap:wrap;margin-top:0">
+      ${needsKey ? '' : '<button class="link-btn" data-action="pick-photo" data-domain="retail">Shelf photo</button><button class="link-btn" data-action="pick-photo" data-domain="horeca">Wine list photo</button>'}
+    </p>
+    <h2 class="section-title">Try it without a key</h2>
+    <p style="display:flex;gap:22px;flex-wrap:wrap;margin-top:0">
+      <button class="link-btn" data-action="demo" data-domain="retail">Demo shelf</button>
+      <button class="link-btn" data-action="demo" data-domain="horeca">Demo wine list</button>
     </p>
   </main>`;
 }
 
 function viewCapture() {
-  const shots = S.photos.map((p, i) => `<div class="shot"><img src="${p.previewUrl}" alt="Shelf photo ${i + 1}"><button data-action="remove-photo" data-i="${i}" aria-label="Remove photo ${i + 1}">×</button></div>`).join('');
+  const c = C();
+  const shots = S.photos.map((p, i) => `<div class="shot"><img src="${p.previewUrl}" alt="Photo ${i + 1}"><button data-action="remove-photo" data-i="${i}" aria-label="Remove photo ${i + 1}">×</button></div>`).join('');
   const busy = S.photos.some((p) => !p.prepared);
-  return `${topBar('Your shelf', `${S.photos.length} photo${S.photos.length === 1 ? '' : 's'}`, { back: 'home' })}
+  return `${topBar(c.title, `${S.photos.length} photo${S.photos.length === 1 ? '' : 's'}`, { back: 'home' })}
   <main class="page">
+    ${placeCard()}
     <div class="shots">
       ${shots}
-      ${S.photos.length < 4 ? `<button class="shot add" data-action="take-photo">${ICON.camera}<br>Add another section</button>` : ''}
+      ${S.photos.length < 4 ? `<button class="shot add" data-action="take-photo" data-domain="${S.domain}">${ICON.camera}<br>${c.add}</button>` : ''}
     </div>
-    ${S.photos.length < 4 ? '<p><button class="link-btn" data-action="pick-photo">Add from your photos</button></p>' : ''}
-    <ul class="tips">
-      <li>Hold the phone straight, about one step back, so labels and price tags are both readable.</li>
-      <li>For a long shelf, take one photo per section. Overlap is fine.</li>
-    </ul>
+    ${S.photos.length < 4 ? `<p><button class="link-btn" data-action="pick-photo" data-domain="${S.domain}">Add from your photos</button></p>` : ''}
+    <ul class="tips">${c.tips.map((t) => `<li>${t}</li>`).join('')}</ul>
   </main>
   <div class="bar">
-    <button class="btn primary" data-action="analyze" ${!S.photos.length || busy ? 'disabled' : ''}>${busy ? '<span class="spinner"></span> Preparing photo' : 'Read the shelf'}</button>
+    <button class="btn primary" data-action="analyze" ${!S.photos.length || busy ? 'disabled' : ''}>${busy ? '<span class="spinner"></span> Preparing photo' : c.read}</button>
   </div>`;
 }
 
 function progressCard() {
   const e = S.extraction;
+  const c = C();
   if (e.status === 'running') {
-    return `<div class="progress-card"><div class="spinner" aria-hidden="true"></div><div class="meter"><div class="label">Reading labels and price tags…</div><div class="track"><div class="fill indeterminate"></div></div></div></div>`;
+    return `<div class="progress-card"><div class="spinner" aria-hidden="true"></div><div class="meter"><div class="label">${c.reading}</div><div class="track"><div class="fill indeterminate"></div></div></div></div>`;
   }
   if (e.status === 'done') {
-    const priced = e.bottles.filter((b) => effectiveShelfPrice(b));
+    const priced = e.bottles.filter((b) => effectiveShelfPrice(b) && !effectiveShelfPrice(b).byGlass);
     const ps = priced.map((b) => effectiveShelfPrice(b).price);
     const range = ps.length ? ` · ${lei0(Math.min(...ps))}–${lei0(Math.max(...ps))} lei` : '';
     const byType = {};
     e.bottles.forEach((b) => { byType[b.color] = (byType[b.color] || 0) + 1; });
     const typeStr = Object.entries(byType).map(([t, n]) => `${n} ${TYPE_LABEL[t].toLowerCase()}`).join(', ');
-    return `<div class="progress-card">${ICON.check}<div class="meter"><div class="label"><b>${e.bottles.length} wines found</b>${range}<br><span style="color:#a9c2b8;font-size:14px">${esc(typeStr)}</span></div></div></div>`;
+    const other = S.domain === 'horeca' ? 'retail' : 'horeca';
+    const wrongKind = (S.domain === 'retail' && e.photoKind === 'menu') || (S.domain === 'horeca' && e.photoKind === 'shelf');
+    return `${wrongKind ? `<div class="notice">This looks like a ${S.domain === 'retail' ? 'restaurant wine list' : 'shop shelf'}. <button class="link-btn" data-action="switch-domain" data-domain="${other}">Read it as a ${COPY[other].noun}</button> so prices are compared with ${other === 'horeca' ? 'restaurants' : 'shops'}.</div>` : ''}
+    <div class="progress-card">${ICON.check}<div class="meter"><div class="label"><b>${e.bottles.length} ${c.found}</b>${range}<br><span class="muted-on-chrome">${esc(typeStr)}</span></div></div></div>`;
   }
   if (e.status === 'error') {
-    return `<div class="notice error"><b>Couldn't read the shelf.</b> ${esc(e.error)}<br><button class="link-btn" data-action="retry-extract">Try again</button></div>`;
+    return `<div class="notice error"><b>Couldn't read the ${c.noun}.</b> ${esc(e.error)}<br><button class="link-btn" data-action="retry-extract">Try again</button></div>`;
   }
   return '';
 }
+
+const matchText = (n) => `${n} wine${n === 1 ? '' : 's'} ${C().on} match${n === 1 ? 'es' : ''} your type and price.`;
 
 function countMatching() {
   if (S.extraction.status !== 'done') return null;
@@ -188,23 +252,25 @@ function countMatching() {
 
 function viewPrefs() {
   const p = S.prefs;
+  const c = C();
   const types = [['red', 'Red'], ['white', 'White'], ['rose', 'Rosé'], ['sparkling', 'Sparkling'], ['other', 'Other']];
-  const presets = [[null, 30, 'Under 30'], [30, 60, '30–60'], [60, 100, '60–100'], [100, null, '100+'], [null, null, 'Any price']];
+  const presets = c.presets;
   const pr = [
-    ['value', 'Best deal', 'Biggest gap between its usual price and this shelf'],
+    ['value', S.domain === 'horeca' ? 'Fairest price' : 'Best deal', c.prio],
     ['balanced', 'Balanced', 'Good ratings at a fair price'],
     ['quality', 'Best rated', 'Highest ratings within my budget'],
   ];
   const n = countMatching();
   const waiting = S.prefsSubmitted && S.extraction.status === 'running';
-  return `${topBar('What are you after?', S.demo ? 'Demo shelf' : '', { back: 'cancel' })}
+  return `${topBar('What are you after?', S.demo ? c.demo : (S.domain === 'horeca' ? 'Restaurant wine list' : ''), { back: 'cancel' })}
   <main class="page">
     ${progressCard()}
+    ${placeCard()}
     <h2>Type</h2>
     <div class="chips" role="group" aria-label="Wine type">
       ${types.map(([k, l]) => `<button class="chip" data-action="toggle-type" data-v="${k}" aria-pressed="${p.types.includes(k)}"><span class="dot" style="background:${TYPE_COLOR[k]}"></span>${l}</button>`).join('')}
     </div>
-    <h2>Price on the shelf</h2>
+    <h2>${c.priceOn}</h2>
     <div class="price-row">
       <label class="field"><small>From</small><input inputmode="decimal" data-input="minPrice" value="${p.minPrice ?? ''}" placeholder="0" aria-label="Minimum price"><span>lei</span></label>
       <label class="field"><small>To</small><input inputmode="decimal" data-input="maxPrice" value="${p.maxPrice ?? ''}" placeholder="any" aria-label="Maximum price"><span>lei</span></label>
@@ -216,11 +282,12 @@ function viewPrefs() {
     <div class="seg" role="group" aria-label="Priority">
       ${pr.map(([k, t, d]) => `<button data-action="priority" data-v="${k}" aria-pressed="${p.priority === k}"><b>${t}</b><span>${d}</span></button>`).join('')}
     </div>
-    ${n != null ? `<p class="hint">${n} wine${n === 1 ? '' : 's'} on this shelf match${n === 1 ? 'es' : ''} your type and price.</p>` : ''}
+    ${S.domain === 'horeca' ? '<p class="hint">Wines sold only by the glass count as their bottle price (glass price × 5 for 150 ml).</p>' : ''}
+    ${n != null ? `<p class="hint" data-count>${matchText(n)}</p>` : ''}
   </main>
   <div class="bar">
     <button class="btn primary" data-action="submit-prefs" ${p.types.length === 0 || n === 0 || S.extraction.status === 'error' ? 'disabled' : ''}>
-      ${waiting ? '<span class="spinner"></span> Waiting for the shelf' : 'Find my wines'}
+      ${waiting ? `<span class="spinner"></span> Waiting for the ${c.noun}` : 'Find my wines'}
     </button>
   </div>`;
 }
@@ -232,7 +299,7 @@ function viewLookup() {
     const k = wineKey(b);
     const st = L.progress[k] || 'waiting';
     const icon = { cached: ICON.db, done: ICON.check, failed: ICON.x, searching: '<span class="spinner" style="width:18px;height:18px;border-width:2px;border-color:#c9d3c8;border-top-color:#173029"></span>' }[st] || ICON.dot;
-    const sub = { cached: 'From your wine list', done: 'Ratings and prices found', failed: 'Lookup failed, scored on shelf data only', searching: 'Searching ratings and prices…', waiting: 'Queued' }[st];
+    const sub = { cached: 'From your saved wines', done: C().done, failed: `Lookup failed, scored on ${C().noun} data only`, searching: C().searching, waiting: 'Queued' }[st];
     const sp = effectiveShelfPrice(b);
     return `<li><span class="state">${icon}</span><div class="grow"><div class="t">${esc(label(b))}${b.vintage ? ` ${b.vintage}` : ''}</div><div class="s">${sp ? lei(sp.price) + ' lei · ' : ''}${sub}</div></div></li>`;
   }).join('');
@@ -248,15 +315,21 @@ function viewLookup() {
 function pickCard(s, i) {
   const b = s.bottle, info = s.info || {};
   const sp = s.shelf;
+  const c = C();
+  const horeca = S.domain === 'horeca';
   let delta = '';
   if (s.ratio != null) {
     const pct = Math.round((1 - 1 / s.ratio) * 100);
     const cls = pct >= 5 ? '' : pct <= -5 ? 'dear' : 'even';
-    delta = `<div class="delta ${cls}"><b>${pct >= 5 ? '−' + pct + '%' : pct <= -5 ? '+' + -pct + '%' : '≈'}</b><small>vs usual<br>${lei0(s.market.value)} lei</small></div>`;
+    delta = `<div class="delta ${cls}"><b>${pct >= 5 ? '−' + pct + '%' : pct <= -5 ? '+' + -pct + '%' : '≈'}</b><small>${horeca ? 'vs other<br>restaurants' : 'vs usual'}<br>${lei0(s.market.value)} lei</small></div>`;
   } else {
-    delta = `<div class="delta even"><b>?</b><small>usual price<br>not found</small></div>`;
+    delta = `<div class="delta even"><b>?</b><small>${c.missing}</small></div>`;
   }
   const [int, dec] = lei(sp?.price).split(',');
+  const priceNote = sp?.byGlass
+    ? `<span class="was">per glass (${sp.glassMl} ml) · ≈ ${lei0(sp.per750)} lei per bottle</span>`
+    : (horeca && b.glass_price ? `<span class="was">bottle · glass ${lei0(b.glass_price)} lei${b.glass_ml ? ` / ${b.glass_ml} ml` : ''}</span>`
+      : (horeca ? '<span class="was">per bottle</span>' : ''));
   const why = reasons(s, lei0).map((r) => `<li>${esc(r)}</li>`).join('');
   return `<article class="pick">
     <div class="pick-head">
@@ -266,9 +339,10 @@ function pickCard(s, i) {
         <div class="meta"><span class="type-dot" style="background:${TYPE_COLOR[b.color]}"></span>${TYPE_LABEL[b.color]}${b.grapes?.length ? ` · ${esc(b.grapes.join(', '))}` : ''}${b.region || b.country ? ` · ${esc([b.region, b.country].filter(Boolean).join(', '))}` : ''}</div>
       </div>
     </div>
-    <div class="tag" role="img" aria-label="Shelf price ${lei(sp?.price)} lei">
-      <div class="price"><span class="n">${int ?? '–'}${dec ? `<sup>,${dec}</sup>` : ''}</span><span class="cur">lei</span>
+    <div class="tag ${horeca ? 'menu' : ''}" role="img" aria-label="${c.priceLabel} ${lei(sp?.price)} lei">
+      <div class="price"><span class="n">${int ?? '–'}${dec && dec !== '00' ? `<sup>,${dec}</sup>` : ''}</span><span class="cur">lei</span>
         ${b.promo_price && b.shelf_price && b.promo_price < b.shelf_price ? `<span class="was">Promo, was ${lei(b.shelf_price)} lei</span>` : ''}
+        ${priceNote}
       </div>
       ${delta}
     </div>
@@ -280,7 +354,7 @@ function pickCard(s, i) {
     ${info.review_summary ? `<p class="review">${esc(info.review_summary)}${info.pairing ? ` <b>With:</b> ${esc(info.pairing)}` : ''}</p>` : ''}
     ${info.vintage_matched === false ? '<span class="flag">Ratings are for another vintage</span>' : ''}
     <div class="pick-actions">
-      ${b.bbox ? `<button class="link-btn" data-action="show-shelf" data-idx="${b.idx}">Show on shelf</button>` : ''}
+      ${b.bbox ? `<button class="link-btn" data-action="show-shelf" data-idx="${b.idx}">${c.show}</button>` : ''}
       <button class="link-btn" data-action="details" data-idx="${b.idx}">Details and sources</button>
       <button class="link-btn" data-action="fix" data-idx="${b.idx}">Wrong wine?</button>
     </div>
@@ -290,14 +364,15 @@ function pickCard(s, i) {
 function viewResults() {
   const R = S.results;
   if (!R) return viewHome();
+  const c = C();
   const picks = R.top.length
     ? R.top.map(pickCard).join('')
-    : `<div class="notice">No wines on this shelf match. Try a wider price range or another type.</div>`;
+    : `<div class="notice">${c.noMatch}</div>`;
 
   const candKeys = new Set(currentCandidates().map((b) => b.idx));
   const all = S.extraction.bottles.map((b) => {
     const info = S.lookup.infoByKey[wineKey(b)] || null;
-    return { bottle: b, info, ...scoreWine(b, info, S.prefs, { EUR: settings.eurRon }), included: candKeys.has(b.idx) };
+    return { bottle: b, info, ...scoreWine(b, info, S.prefs, rates(), S.domain), included: candKeys.has(b.idx) };
   });
   const sorters = {
     score: (a, b) => (b.included - a.included) || (b.score - a.score),
@@ -310,7 +385,7 @@ function viewResults() {
     const pct = s.ratio != null ? Math.round((1 - 1 / s.ratio) * 100) : null;
     return `<tr class="${s.included ? '' : 'excluded'}">
       <td><button data-action="details" data-idx="${s.bottle.idx}"><span class="type-dot" style="background:${TYPE_COLOR[s.bottle.color]}"></span>${esc(label(s.bottle))}${s.bottle.vintage ? ' ' + s.bottle.vintage : ''}</button></td>
-      <td class="num">${s.shelf ? lei(s.shelf.price) : '–'}</td>
+      <td class="num">${s.shelf ? lei(s.shelf.price) + (s.shelf.byGlass ? '<small> /gl.</small>' : '') : '–'}</td>
       <td class="num">${typeof s.info?.rating === 'number' ? s.info.rating.toFixed(1) : '–'}</td>
       <td class="num">${pct == null ? '–' : (pct > 0 ? '−' : '+') + Math.abs(pct) + '%'}</td>
     </tr>`;
@@ -322,16 +397,21 @@ function viewResults() {
     const c = (eu ? estimateCost(eu, MODELS[settings.visionModel]) : 0) + (u ? estimateCost(u, MODELS[settings.lookupModel]) : 0);
     cost = `<p class="cost">This scan: about $${c.toFixed(2)} in API usage${u ? `, ${u.web_search_requests} web searches` : ''}.</p>`;
   }
-  return `${topBar(R.top.length ? 'Your picks' : 'No match', S.extraction.storeHint ? S.extraction.storeHint : (S.demo ? 'Demo shelf, fictional wines' : ''), { back: 'home' })}
+  const sub = S.demo ? c.demo : (S.geo.place?.name || S.extraction.storeHint || (S.domain === 'horeca' ? 'Restaurant wine list' : ''));
+  const horecaNoPrices = S.domain === 'horeca' && R.top.length && R.top.every((t) => !t.market);
+  return `${topBar(R.top.length ? 'Your picks' : 'No match', sub, { back: 'home' })}
   <main class="page">
-    ${S.lookup.failed ? `<div class="notice">Some lookups failed; those wines were scored on shelf data only.</div>` : ''}
+    ${S.domain === 'horeca' ? `<div class="domain-strip">${ICON.menu}<span>Restaurant prices: compared only with what other restaurants charge, never with shop prices.</span></div>` : ''}
+    ${placeCard()}
+    ${S.lookup.failed ? `<div class="notice">Some lookups failed; those wines were scored on ${c.noun} data only.</div>` : ''}
+    ${horecaNoPrices ? '<div class="notice">No other restaurants\' prices were found for these wines, so they are ranked on ratings only.</div>' : ''}
     ${picks}
-    <h2 class="section-title">Everything on the shelf</h2>
+    <h2 class="section-title">${c.every}</h2>
     <div class="sortbar" role="group" aria-label="Sort">
       ${[['score', 'Best match'], ['value', 'Best deal'], ['rating', 'Rating'], ['price', 'Price']].map(([k, l]) => `<button class="chip plain" data-action="sort" data-v="${k}" aria-pressed="${sortBy === k}">${l}</button>`).join('')}
     </div>
     <table class="all-table">
-      <thead><tr><th>Wine</th><th class="num">Lei</th><th class="num">★</th><th class="num">vs usual</th></tr></thead>
+      <thead><tr><th>Wine</th><th class="num">Lei</th><th class="num">★</th><th class="num">${c.vsCol}</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <p class="hint">Greyed wines are outside your type or price filter.</p>
@@ -339,14 +419,15 @@ function viewResults() {
   </main>
   <div class="bar">
     <button class="btn secondary" data-action="edit-prefs">Change filters</button>
-    <button class="btn primary" data-action="new-scan">${ICON.camera} New scan</button>
+    <button class="btn primary" data-action="new-scan" data-domain="${S.domain}">${ICON.camera} New scan</button>
   </div>`;
 }
 
 function viewHistory() {
   const tabs = `<div class="chips" style="margin-bottom:12px" role="tablist">
     <button class="chip plain" role="tab" data-action="htab" data-v="scans" aria-pressed="${historyTab === 'scans'}">Past scans</button>
-    <button class="chip plain" role="tab" data-action="htab" data-v="wines" aria-pressed="${historyTab === 'wines'}">Wine list</button>
+    <button class="chip plain" role="tab" data-action="htab" data-v="wines" aria-pressed="${historyTab === 'wines'}">Saved wines</button>
+    <button class="chip plain" role="tab" data-action="htab" data-v="places" aria-pressed="${historyTab === 'places'}">Places</button>
   </div>`;
   let body;
   if (historyTab === 'scans') {
@@ -354,15 +435,26 @@ function viewHistory() {
       ? `<ul class="list">${historyData.scans.map((s) => `<li><button class="row" data-action="open-scan" data-id="${s.id}">
           ${s.thumb ? `<img src="${s.thumb}" alt="">` : ''}
           <span class="grow"><span class="t">${esc(s.topLabels?.[0] || 'No pick')}</span>
-          <span class="s">${new Date(s.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}${s.store ? ' · ' + esc(s.store) : ''} · ${s.bottles.length} wines</span></span></button></li>`).join('')}</ul>`
-      : `<p class="lede">Your scans appear here after your first shelf.</p>`;
-  } else {
+          <span class="s">${badge(s.domain)} ${new Date(s.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}${s.place?.name || s.store ? ' · ' + esc(s.place?.name || s.store) : ''} · ${s.bottles.length} wines</span></span></button></li>`).join('')}</ul>`
+      : `<p class="lede">Your scans appear here after your first shelf or wine list.</p>`;
+  } else if (historyTab === 'wines') {
     const ws = historyData.wines.slice().sort((a, b) => (b.info?.rating ?? 0) - (a.info?.rating ?? 0));
+    const usual = (w) => w.domain === 'horeca'
+      ? (w.info?.horeca_price_ron ? 'restaurants ~' + lei0(w.info.horeca_price_ron) + ' lei' : 'no restaurant price')
+      : (w.info?.local_price_ron ? 'usually ' + lei0(w.info.local_price_ron) + ' lei' : w.info?.market_price_eur ? 'usually ' + lei0(w.info.market_price_eur * settings.eurRon) + ' lei' : 'no price');
     body = ws.length
       ? `<ul class="list">${ws.map((w) => `<li><button class="row" data-action="wine-detail" data-key="${esc(w.key)}">
           <span class="grow"><span class="t">${esc(w.label)}</span>
-          <span class="s">${typeof w.info?.rating === 'number' ? w.info.rating.toFixed(1) + '★ · ' : ''}${w.info?.local_price_ron ? 'usually ' + lei0(w.info.local_price_ron) + ' lei' : w.info?.market_price_eur ? 'usually ' + lei0(w.info.market_price_eur * settings.eurRon) + ' lei' : 'no price'} · checked ${new Date(w.fetchedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</span></span></button></li>`).join('')}</ul>`
-      : `<p class="lede">Every wine Oeno looks up is saved here, so the next scan of the same shelf is instant and free.</p>`;
+          <span class="s">${badge(w.domain)} ${typeof w.info?.rating === 'number' ? w.info.rating.toFixed(1) + '★ · ' : ''}${usual(w)} · checked ${new Date(w.fetchedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</span></span></button></li>`).join('')}</ul>`
+      : `<p class="lede">Every wine Oeno looks up is saved here, so the next scan of the same wines is instant and free.</p>`;
+  } else {
+    const ps = historyData.places;
+    body = ps.length
+      ? `<ul class="list">${ps.map((p) => `<li><button class="row" data-action="place-detail" data-id="${esc(p.id)}">
+          <span class="pin-dot ${p.domain}">${ICON.pin}</span>
+          <span class="grow"><span class="t">${esc(p.name)}</span>
+          <span class="s">${badge(p.domain)} ${[KIND_LABEL[p.kind], p.address].filter(Boolean).map(esc).join(' · ')}${p.kind || p.address ? ' · ' : ''}${p.visits || 0} visit${p.visits === 1 ? '' : 's'}</span></span></button></li>`).join('')}</ul>`
+      : `<p class="lede">Shops and restaurants where you scan are saved here, with the prices you saw. Allow location when Oeno asks, or add the place by name.</p>`;
   }
   return `${topBar('Your wines', '', { back: 'home' })}<main class="page">${tabs}${body}</main>`;
 }
@@ -388,12 +480,15 @@ function viewSettings() {
     <div class="form-row"><label for="ml">Most wines to look up per scan</label><input id="ml" type="number" min="3" max="40" data-setting="maxLookups" value="${settings.maxLookups}"></div>
     <div class="form-row"><label for="cd">Reuse saved lookups for (days)</label><input id="cd" type="number" min="1" max="365" data-setting="cacheDays" value="${settings.cacheDays}"></div>
     <div class="form-row"><label for="fx">Euro rate (lei per €)</label><input id="fx" type="number" step="0.01" data-setting="eurRon" value="${settings.eurRon}"><p class="hint">Used to compare international prices with the shelf. Check the BNR rate occasionally.</p></div>
-    <label class="toggle"><input type="checkbox" data-setting="includeUnpriced" ${settings.includeUnpriced ? 'checked' : ''}> Include wines whose price tag couldn't be read</label>
+    <label class="toggle"><input type="checkbox" data-setting="includeUnpriced" ${settings.includeUnpriced ? 'checked' : ''}> Include wines whose price couldn't be read</label>
+    <h2 class="section-title">Location</h2>
+    <label class="toggle"><input type="checkbox" data-setting="saveLocation" ${settings.saveLocation ? 'checked' : ''}> Save where I scan (shop or restaurant)</label>
+    <p class="hint">Uses your phone's location when you take the photo, or the location stored in a photo you choose. Coordinates are sent to OpenStreetMap only to find the place name; places and prices are stored only on this phone.</p>
     <h2 class="section-title">Your data</h2>
     <div class="chips">
       <button class="chip plain" data-action="export">Export backup</button>
       <label class="chip plain" style="cursor:pointer">Import backup<input type="file" accept="application/json" data-action-change="import" class="sr"></label>
-      <button class="chip plain" data-action="clear-data">Delete all saved wines</button>
+      <button class="chip plain" data-action="clear-data">Delete all saved data</button>
     </div>
     <p class="hint" style="margin-top:24px">Ratings and prices are found by Claude with web search and can be wrong. Check the sources before relying on them.</p>
   </main>`;
@@ -404,6 +499,10 @@ function render() {
   // Preserve focus/caret in price inputs while re-rendering.
   const active = document.activeElement?.dataset?.input;
   const caret = active ? document.activeElement.selectionStart : null;
+  // Restaurant screens use their own colour scheme so the two price domains are never confused.
+  const horecaTheme = S.domain === 'horeca' && ['capture', 'prefs', 'lookup', 'results'].includes(screen);
+  document.body.classList.toggle('horeca', horecaTheme);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', horecaTheme ? '#3b1520' : '#173029');
   $app.innerHTML = (views[screen] || viewHome)();
   if (active) {
     const el = $app.querySelector(`[data-input="${active}"]`);
@@ -515,21 +614,33 @@ function shelfSheet(idx) {
     return `<div class="box ${x.idx === idx ? '' : 'dim'}" style="left:${x0}%;top:${y0}%;width:${x1 - x0}%;height:${y1 - y0}%"><span class="lbl">${rank}</span></div>`;
   }).join('');
   openSheet(`<h3>${esc(label(b))}</h3><p class="hint" style="margin-top:0">Highlighted on your photo${S.photos.length > 1 ? ` (photo ${b.photo + 1})` : ''}. Position is approximate.</p>
-    <div class="shelf-view"><img src="${src}" alt="Shelf photo">${boxes}</div>`);
+    <div class="shelf-view ${S.domain === 'horeca' ? 'menu' : ''}"><img src="${src}" alt="Your photo">${boxes}</div>`);
 }
 
-function detailsSheet(b, info, extraNote = '') {
-  const s = b ? scoreWine(b, info, S.prefs, { EUR: settings.eurRon }) : null;
+function detailsSheet(b, info, extraNote = '', domain = S.domain) {
+  const s = b ? scoreWine(b, info, S.prefs, rates(), domain) : null;
+  const horeca = domain === 'horeca';
   const rows = [];
   if (b) {
     const sp = effectiveShelfPrice(b);
-    rows.push(['Shelf price', sp ? `${lei(sp.price)} lei${b.volume_ml && b.volume_ml !== 750 ? ` (${b.volume_ml} ml)` : ''}` : 'not read']);
-    if (b.price_tag_text) rows.push(['Tag says', b.price_tag_text]);
+    const vol = b.volume_ml && b.volume_ml !== 750 ? ` (${b.volume_ml} ml)` : '';
+    rows.push([COPY[horeca ? 'horeca' : 'retail'].priceLabel, sp
+      ? (sp.byGlass ? `${lei(sp.price)} lei per glass (${sp.glassMl} ml), ≈ ${lei0(sp.per750)} lei per bottle` : `${lei(sp.price)} lei${vol}`)
+      : 'not read']);
+    if (horeca && b.glass_price && !sp?.byGlass) rows.push(['By the glass', `${lei(b.glass_price)} lei${b.glass_ml ? ` / ${b.glass_ml} ml` : ''}`]);
+    if (b.section) rows.push(['Menu section', b.section]);
+    if (b.price_tag_text) rows.push([horeca ? 'Menu says' : 'Tag says', b.price_tag_text]);
   }
   if (info) {
     if (info.matched_name) rows.push(['Matched as', info.matched_name]);
-    if (info.local_price_ron) rows.push(['Romanian retail', `about ${lei0(info.local_price_ron)} lei`]);
-    if (info.market_price_eur) rows.push(['International', `about €${info.market_price_eur.toFixed(2)} (${lei0(info.market_price_eur * settings.eurRon)} lei)${info.price_low_eur && info.price_high_eur ? `, range €${info.price_low_eur}–${info.price_high_eur}` : ''}`]);
+    if (horeca) {
+      rows.push(['Other restaurants', info.horeca_price_ron
+        ? `about ${lei0(info.horeca_price_ron)} lei per bottle${info.horeca_sample_count ? ` (median of ${info.horeca_sample_count})` : ''}${info.horeca_price_low_ron && info.horeca_price_high_ron ? `, range ${lei0(info.horeca_price_low_ron)}–${lei0(info.horeca_price_high_ron)}` : ''}`
+        : 'no restaurant prices found']);
+    } else {
+      if (info.local_price_ron) rows.push(['Romanian retail', `about ${lei0(info.local_price_ron)} lei`]);
+      if (info.market_price_eur) rows.push(['International', `about €${info.market_price_eur.toFixed(2)} (${lei0(info.market_price_eur * settings.eurRon)} lei)${info.price_low_eur && info.price_high_eur ? `, range €${info.price_low_eur}–${info.price_high_eur}` : ''}`]);
+    }
     if (typeof info.rating === 'number') rows.push(['Rating', `${info.rating.toFixed(1)}/5${info.rating_count ? ` (${info.rating_count.toLocaleString('en-US')})` : ''}${info.rating_source ? ', ' + info.rating_source : ''}`]);
     if (typeof info.critic_score === 'number') rows.push(['Critics', `${info.critic_score} pts${info.critic_source ? ', ' + info.critic_source : ''}`]);
     if (info.pairing) rows.push(['Goes with', info.pairing]);
@@ -543,10 +654,15 @@ function detailsSheet(b, info, extraNote = '') {
   const srcHtml = srcList.filter((x) => x?.url && !seen.has(x.url) && seen.add(x.url)).slice(0, 10)
     .map((x) => `<li><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title || x.url)}</a></li>`).join('');
   const name = b ? label(b) + (b.vintage ? ' ' + b.vintage : '') : info?.matched_name || 'Wine';
+  const examples = horeca && info?.horeca_examples?.length
+    ? `<h2 class="section-title">What other restaurants charge</h2><ul class="sources">${info.horeca_examples.map((e) => `<li>${e.url ? `<a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.venue)}</a>` : esc(e.venue)}${e.city ? ', ' + esc(e.city) : ''}: ${lei0(e.price_ron)} lei${e.note ? ` (${esc(e.note)})` : ''}</li>`).join('')}</ul>`
+    : '';
   openSheet(`<h3>${esc(name)}</h3>
+    <p style="margin:2px 0 8px">${badge(domain)}</p>
     ${info?.review_summary ? `<p class="review">${esc(info.review_summary)}</p>` : ''}
     ${!info && b ? '<p class="hint">Not looked up: outside your filters, or the lookup failed.</p>' : ''}
     <dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
+    ${examples}
     ${srcHtml ? `<h2 class="section-title">Sources</h2><ul class="sources">${srcHtml}</ul>` : ''}
     ${extraNote}
     ${b ? `<button class="btn ghost" style="width:100%;margin-top:10px" data-action="fix" data-idx="${b.idx}">Wrong wine? Correct it</button>` : ''}`);
@@ -562,9 +678,177 @@ function fixSheet(idx) {
       <div class="form-row"><label>Wine name / grape</label><input type="text" name="name" value="${esc(b.name)}"></div>
       <div class="form-row"><label>Vintage</label><input type="number" name="vintage" value="${b.vintage ?? ''}" placeholder="NV"></div>
       <div class="form-row"><label>Type</label><select name="color">${types.map((t) => `<option value="${t}" ${b.color === t ? 'selected' : ''}>${TYPE_LABEL[t]}</option>`).join('')}</select></div>
-      <div class="form-row"><label>Shelf price (lei)</label><input type="text" inputmode="decimal" name="price" value="${b.promo_price ?? b.shelf_price ?? ''}"></div>
+      <div class="form-row"><label>${S.domain === 'horeca' ? 'Bottle price (lei)' : 'Shelf price (lei)'}</label><input type="text" inputmode="decimal" name="price" value="${b.promo_price ?? b.shelf_price ?? ''}"></div>
+      ${S.domain === 'horeca' ? `<div class="form-row"><label>Glass price (lei)</label><input type="text" inputmode="decimal" name="glass" value="${b.glass_price ?? ''}"></div>` : ''}
       <button class="btn primary" style="width:100%" type="submit">Save and look up again</button>
     </form>`);
+}
+
+/* ------------------------------------------------------------------ places (geotagging) */
+
+const placeScreens = ['capture', 'prefs', 'results'];
+const rerenderPlace = () => { if (placeScreens.includes(screen)) render(); };
+const plainPlace = ({ distance, known, ...p }) => p; // drop UI-only fields before saving
+
+function placeSub(p) {
+  const bits = [KIND_LABEL[p.kind], p.address];
+  if (p.distance != null) bits.push(`${p.distance} m away`);
+  if (p.visits) bits.push(`${p.visits} visit${p.visits === 1 ? '' : 's'} before`);
+  if (S.geo.chosenBy === 'hint' && p === S.geo.place) bits.push(`name from the ${S.domain === 'horeca' ? 'menu' : 'price tags'}`);
+  return bits.filter(Boolean).join(' · ');
+}
+
+function placeCard() {
+  if (S.demo) return '';
+  const g = S.geo;
+  if (g.status === 'off' && !g.place) return '';
+  const c = C();
+  let main, sub = '', btn = 'Change', busy = false;
+  if (g.place) { main = g.place.name; sub = placeSub(g.place); }
+  else if (g.status === 'locating') { main = 'Finding where you are…'; busy = true; }
+  else if (g.status === 'searching') { main = c.where; busy = true; }
+  else if (g.status === 'denied') { main = 'Location is off'; sub = `Add the ${c.placeWord} by name, or allow location for Oeno in iPhone Settings`; btn = 'Add'; }
+  else if (g.candidates.length) { main = `Which ${c.placeWord} is this?`; sub = `${g.candidates.length} nearby`; btn = 'Choose'; }
+  else if (g.status === 'idle') return '';
+  else { main = `${c.placeWord[0].toUpperCase() + c.placeWord.slice(1)} not found`; sub = g.osmError ? 'Place search did not answer. Add it by name.' : 'Add it by name'; btn = 'Add'; }
+  return busy
+    ? `<div class="place-card busy"><span class="pc-pin">${ICON.pin}</span><span class="grow"><b>${esc(main)}</b></span><span class="spinner small" aria-hidden="true"></span></div>`
+    : `<button class="place-card ${g.place ? '' : 'ask'}" data-action="place-sheet"><span class="pc-pin">${ICON.pin}</span><span class="grow"><b>${esc(main)}</b>${sub ? `<span>${esc(sub)}</span>` : ''}</span><span class="pc-btn">${btn}</span></button>`;
+}
+
+function placeSheet() {
+  const g = S.geo, c = C();
+  const list = g.candidates.map((p) => `<li><button class="row" data-action="choose-place" data-id="${esc(p.id)}">
+      <span class="grow"><span class="t">${esc(p.name)}${p.known ? ' <span class="badge known">Saved</span>' : ''}</span><span class="s">${esc([KIND_LABEL[p.kind], p.address, p.distance != null ? p.distance + ' m' : null].filter(Boolean).join(' · '))}</span></span>
+      ${g.place?.id === p.id ? `<span class="sel">${ICON.tick}</span>` : ''}</button></li>`).join('');
+  const hint = g.place?.source === 'manual' || g.place?.source === 'hint' ? g.place.name : (S.extraction.storeHint || '');
+  openSheet(`<h3>Where are you?</h3>
+    <p class="hint" style="margin-top:0">The ${c.placeWord} is saved with the prices you see here, for later comparisons.${g.pos ? '' : ' Location is not available, so add it by name.'}</p>
+    ${list ? `<ul class="list place-list">${list}</ul>` : ''}
+    <form data-form="place" style="margin-top:16px">
+      <div class="form-row"><label for="pn">${list ? 'Somewhere else' : `${c.placeWord[0].toUpperCase() + c.placeWord.slice(1)} name`}</label>
+      <input id="pn" type="text" name="name" autocomplete="off" placeholder="${esc(c.placeHolder)}" value="${esc(hint)}"></div>
+      <button class="btn primary" style="width:100%" type="submit">Use this name</button>
+    </form>
+    <div class="pick-actions" style="margin-top:12px">
+      ${g.status !== 'locating' && g.status !== 'searching' ? '<button class="link-btn" data-action="retry-locate">Find my location again</button>' : ''}
+      ${g.place ? '<button class="link-btn" data-action="place-none">Don\'t save a place for this scan</button>' : ''}
+    </div>`);
+}
+
+/** Start finding the place for this scan. Runs in the background; never blocks the flow. */
+async function startLocate(file, fromLibrary) {
+  if (S.demo || !settings.saveLocation) { S.geo.status = 'off'; return; }
+  const scan = S, g = S.geo, domain = S.domain;
+  g.status = 'locating';
+  rerenderPlace();
+  let pos = fromLibrary && file ? await exifGps(file) : null;
+  if (!pos) {
+    try { pos = await currentPosition(); }
+    catch (e) {
+      if (S !== scan) return;
+      g.status = e.code === 'denied' ? 'denied' : 'nofix';
+      usePrintedName();
+      return rerenderPlace();
+    }
+  }
+  if (S !== scan) return;
+  g.pos = pos;
+  g.status = 'searching';
+  rerenderPlace();
+
+  // Places you saved before, close by, come first.
+  const tol = Math.max(150, (pos.accuracy || 0) * 2);
+  const saved = (await db.allPlaces().catch(() => []))
+    .filter((p) => p.domain === domain && p.lat != null)
+    .map((p) => ({ ...p, known: true, distance: Math.round(distanceM(pos, p)) }))
+    .filter((p) => p.distance <= tol);
+  let osm = [];
+  try { osm = await nearbyPlaces(pos, domain); } catch { g.osmError = true; }
+  if (S !== scan) return;
+  const byId = new Map(saved.map((p) => [p.id, p]));
+  const merged = [...saved];
+  for (const p of osm) {
+    if (byId.has(p.id)) byId.get(p.id).distance = p.distance;
+    else merged.push(p);
+  }
+  g.candidates = merged.sort((a, b) => a.distance - b.distance).slice(0, 12);
+  g.status = 'done';
+  if (g.chosenBy !== 'user') autoPlace();
+  rerenderPlace();
+}
+
+/** Search places for a known position (used when switching shop ↔ restaurant). */
+async function relocateFrom(pos) {
+  const scan = S;
+  let osm = [];
+  try { osm = await nearbyPlaces(pos, S.domain); } catch { S.geo.osmError = true; }
+  if (S !== scan) return;
+  S.geo.candidates = osm.slice(0, 12);
+  S.geo.status = 'done';
+  if (S.geo.chosenBy !== 'user') autoPlace();
+  rerenderPlace();
+}
+
+/** Pick automatically, using the printed store/restaurant name when there is one. */
+function autoPlace() {
+  const g = S.geo;
+  const r = autoChoose(g.candidates, { hint: S.extraction.storeHint, accuracy: g.pos?.accuracy });
+  if (r) { g.place = r.place; g.chosenBy = 'auto'; return; }
+  usePrintedName();
+}
+
+/** No place matched: fall back to the name printed on the price tags or menu. */
+function usePrintedName() {
+  const g = S.geo, h = S.extraction.storeHint;
+  if (!h || g.chosenBy === 'user' || (g.place && g.chosenBy !== 'hint')) return;
+  g.place = manualPlace(h, 'hint');
+  g.chosenBy = 'hint';
+}
+
+function manualPlace(name, source = 'manual') {
+  const pos = S.geo.pos;
+  const base = namePlaceId(name, S.domain);
+  return {
+    id: pos ? `${base}@${pos.lat.toFixed(4)},${pos.lon.toFixed(4)}` : base,
+    name, brand: null, kind: null, domain: S.domain, source, address: null,
+    lat: pos?.lat ?? null, lon: pos?.lon ?? null, accuracy: pos?.accuracy ?? null,
+  };
+}
+
+/** After results were saved, a changed place is applied to the saved scan and its prices. */
+async function placeChanged() {
+  if (S.scanId == null) return;
+  const p = S.geo.place;
+  if (p) await db.upsertPlace(plainPlace(p), { countVisit: true }).catch(() => {});
+  await db.reassignScanPlace(S.scanId, p ? plainPlace(p) : null).catch(() => {});
+  toast(p ? `Saved at ${p.name}` : 'Place removed from this scan');
+}
+
+async function placeDetailSheet(id) {
+  const p = historyData.places.find((x) => x.id === id) || await db.getPlace(id);
+  if (!p) return;
+  const obs = await db.observationsAtPlace(id);
+  const latest = new Map();
+  for (const o of obs) if (!latest.has(o.key)) latest.set(o.key, o);
+  const rows = [...latest.values()].slice(0, 40).map((o) => `<li>${esc(o.label)}: <b>${lei(o.price)} lei</b>${o.priceKind === 'glass' ? ' / glass' : o.promo ? ' (promo)' : ''} · ${new Date(o.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</li>`).join('');
+  openSheet(`<h3>${esc(p.name)}</h3>
+    <p style="margin:2px 0 8px">${badge(p.domain)} <span class="hint">${esc([KIND_LABEL[p.kind], p.address].filter(Boolean).join(' · '))}</span></p>
+    <dl class="kv">
+      <dt>Visits</dt><dd>${p.visits || 0}</dd>
+      <dt>First / last</dt><dd>${new Date(p.firstSeen).toLocaleDateString('en-GB')} / ${new Date(p.lastSeen).toLocaleDateString('en-GB')}</dd>
+      ${p.lat != null ? `<dt>Location</dt><dd><a href="https://www.openstreetmap.org/?mlat=${p.lat}&mlon=${p.lon}#map=19/${p.lat}/${p.lon}" target="_blank" rel="noopener">${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}</a></dd>` : ''}
+      <dt>Wines priced here</dt><dd>${latest.size}</dd>
+    </dl>
+    ${rows ? `<h2 class="section-title">Latest prices you saw here</h2><ul class="sources">${rows}</ul>` : ''}
+    <button class="btn ghost" style="width:100%;margin-top:10px" data-action="forget-place" data-id="${esc(p.id)}">Remove this place</button>`);
+}
+
+/** Your own price history for a wine, in the same domain only. */
+async function seenPricesHtml(key, domain, excludeScan = null) {
+  const obs = (await db.observationsFor(key).catch(() => [])).filter((o) => o.domain === domain && (excludeScan == null || o.scanId !== excludeScan));
+  if (!obs.length) return '';
+  return `<h2 class="section-title">Prices you saw ${domain === 'horeca' ? 'in restaurants' : 'in shops'}</h2><ul class="sources">${obs.slice(0, 8).map((o) => `<li>${lei(o.price)} lei${o.priceKind === 'glass' ? ' / glass' : o.promo ? ' (promo)' : ''} · ${esc(o.placeName || o.store || 'unknown place')} · ${new Date(o.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</li>`).join('')}</ul>`;
 }
 
 /* ------------------------------------------------------------------ flow */
@@ -583,6 +867,7 @@ function pickFiles(fromLibrary = false) {
     if (!file) return;
     const entry = { previewUrl: URL.createObjectURL(file), prepared: null };
     S.photos.push(entry);
+    if (S.photos.length === 1) startLocate(file, fromLibrary);
     go('capture');
     try {
       const p = await prepare(file);
@@ -601,17 +886,14 @@ function pickFiles(fromLibrary = false) {
 async function runExtraction() {
   S.abort?.abort();
   S.abort = new AbortController();
-  S.extraction = { status: 'running', bottles: [], storeHint: null, error: null, usage: null };
+  S.extraction = { status: 'running', bottles: [], storeHint: null, photoKind: null, error: null, usage: null };
   render();
   try {
-    const r = await extract(S.photos.map((p) => p.prepared), settings, S.abort.signal);
-    if (!r.bottles.length) throw new Error('No wine bottles were recognised. Step a little closer and make sure labels are in focus.');
+    const r = await extract(S.photos.map((p) => p.prepared), settings, S.abort.signal, S.domain);
+    if (!r.bottles.length) throw new Error(C().none);
     S.extraction = { status: 'done', ...r, error: null };
-    // Remember the shelf prices you saw (your own price history).
-    r.bottles.forEach((b) => {
-      const sp = effectiveShelfPrice(b);
-      if (sp && (b.producer || b.name)) db.addObservation({ key: wineKey(b), label: label(b), price: sp.price, promo: !!b.promo_price, store: r.storeHint }).catch(() => {});
-    });
+    // The printed store/restaurant name can confirm or correct the place.
+    if (S.geo.chosenBy !== 'user') { if (S.geo.candidates.length) autoPlace(); else usePrintedName(); }
   } catch (e) {
     if (S.abort.signal.aborted) return;
     S.extraction = { ...S.extraction, status: 'error', error: e.message };
@@ -635,7 +917,7 @@ async function runLookup(forceKeys = null) {
   go('lookup');
 
   if (S.demo) {
-    const info = demoInfo();
+    const info = S.domain === 'horeca' ? demoMenuInfo() : demoInfo();
     for (const b of cands) {
       S.lookup.progress[wineKey(b)] = 'searching';
       render();
@@ -654,12 +936,12 @@ async function runLookup(forceKeys = null) {
       S.lookup.progress[key] = state;
       if (info) S.lookup.infoByKey[key] = info;
       if (screen === 'lookup') render();
-    }, S.abort.signal);
+    }, S.abort.signal, S.domain);
     // Merge cached info for wines we did not re-fetch.
     for (const b of cands) {
       const k = wineKey(b);
       if (!S.lookup.infoByKey[k]) {
-        const hit = await db.getWine(k);
+        const hit = await db.getWine(dbKey(k, S.domain));
         if (hit) S.lookup.infoByKey[k] = hit.info;
       }
     }
@@ -675,52 +957,87 @@ async function runLookup(forceKeys = null) {
   }
 }
 
+const rank = (cands) => recommend(cands, S.lookup.infoByKey, S.prefs, rates(), 3, S.domain);
+
 async function finish(cands) {
   S.lookup.status = 'done';
-  S.results = recommend(cands, S.lookup.infoByKey, S.prefs, { EUR: settings.eurRon }, 3);
-  settings.lastPrefs = structuredClone(S.prefs);
+  S.results = rank(cands);
+  settings[prefsKey(S.domain)] = structuredClone(S.prefs);
   saveSettings();
-  if (!S.demo) {
-    const scan = {
-      store: S.extraction.storeHint,
-      bottles: S.extraction.bottles,
-      prefs: S.prefs,
-      topIdx: S.results.top.map((s) => s.bottle.idx),
-      topLabels: S.results.top.map((s) => label(s.bottle)),
-      thumb: S.photos[0]?.thumb || null,
-      thumbs: S.photos.map((p) => p.thumb),
-    };
-    if (S.saved) { /* re-run of the same scan: keep a single history entry */ }
-    else { S.saved = true; db.addScan(scan).catch(() => {}); }
+  if (!S.demo && !S.saved) {
+    // First time this scan reaches results: save it once (re-runs update nothing).
+    S.saved = true;
+    await saveScan().catch((e) => console.warn('save failed', e));
   }
   go('results');
+}
+
+async function saveScan() {
+  const place = S.geo.place ? plainPlace(S.geo.place) : null;
+  const pos = S.geo.pos;
+  if (place) await db.upsertPlace(place, { countVisit: true });
+  S.scanId = await db.addScan({
+    domain: S.domain,
+    store: place?.name || S.extraction.storeHint,
+    placeId: place?.id || null,
+    place: place ? db.snapshot(place) : null,
+    geo: pos ? { lat: pos.lat, lon: pos.lon, accuracy: pos.accuracy, source: pos.source } : null,
+    bottles: S.extraction.bottles,
+    prefs: S.prefs,
+    topIdx: S.results.top.map((s) => s.bottle.idx),
+    topLabels: S.results.top.map((s) => label(s.bottle)),
+    thumb: S.photos[0]?.thumb || null,
+    thumbs: S.photos.map((p) => p.thumb),
+  });
+  // Every priced wine you saw, tagged with domain and place — the base for later comparisons.
+  const obs = [];
+  for (const b of S.extraction.bottles) {
+    const sp = effectiveShelfPrice(b);
+    if (!sp || !(b.producer || b.name)) continue;
+    obs.push({
+      key: wineKey(b), label: label(b), domain: S.domain,
+      price: sp.price, priceKind: sp.byGlass ? 'glass' : (b.promo_price ? 'promo' : 'bottle'),
+      per750: Math.round(sp.per750 * 100) / 100, volume_ml: b.volume_ml ?? null, glass_ml: sp.glassMl ?? null,
+      promo: !!b.promo_price,
+      placeId: place?.id || null, placeName: place?.name || null, store: place?.name || S.extraction.storeHint || null,
+      lat: pos?.lat ?? null, lon: pos?.lon ?? null, accuracy: pos?.accuracy ?? null,
+      scanId: S.scanId,
+    });
+  }
+  if (obs.length) await db.addObservations(obs);
 }
 
 async function openScan(id) {
   const scan = historyData.scans.find((s) => s.id === id);
   if (!scan) return;
-  S = fresh();
+  S = fresh(scan.domain);
   S.saved = true;
+  S.scanId = scan.id;
   S.photos = (scan.thumbs || [scan.thumb]).filter(Boolean).map((t) => ({ previewUrl: t, thumb: t, prepared: null }));
-  S.extraction = { status: 'done', bottles: scan.bottles, storeHint: scan.store, error: null, usage: null };
+  S.extraction = { status: 'done', bottles: scan.bottles, storeHint: scan.store, photoKind: null, error: null, usage: null };
   S.prefs = scan.prefs;
+  S.geo = { ...freshGeo(), status: scan.place ? 'done' : 'off', place: scan.place || null, chosenBy: scan.place ? 'user' : null, pos: scan.geo || null };
   for (const b of scan.bottles) {
-    const hit = await db.getWine(wineKey(b));
+    const hit = await db.getWine(dbKey(wineKey(b), S.domain));
     if (hit) S.lookup.infoByKey[wineKey(b)] = hit.info;
   }
-  S.results = recommend(currentCandidates(), S.lookup.infoByKey, S.prefs, { EUR: settings.eurRon }, 3);
+  S.results = rank(currentCandidates());
   go('results');
 }
 
-function startDemo() {
-  S = fresh();
+function startDemo(domain = 'retail') {
+  S = fresh(domain);
   S.demo = true;
-  S.photos = [{ previewUrl: demoShelfDataUrl(), prepared: {} }];
-  S.prefs = { types: ['red'], minPrice: null, maxPrice: 70, priority: 'value' };
-  S.extraction = { status: 'running', bottles: [], storeHint: null, error: null, usage: null };
+  const menu = domain === 'horeca';
+  S.photos = [{ previewUrl: menu ? demoMenuDataUrl() : demoShelfDataUrl(), prepared: {} }];
+  S.prefs = menu ? { types: ['red'], minPrice: null, maxPrice: 300, priority: 'value' } : { types: ['red'], minPrice: null, maxPrice: 70, priority: 'value' };
+  S.extraction = { status: 'running', bottles: [], storeHint: null, photoKind: null, error: null, usage: null };
+  S.geo.status = 'off';
   go('prefs');
+  const scan = S;
   setTimeout(() => {
-    S.extraction = { status: 'done', bottles: demoBottles(), storeHint: null, error: null, usage: null };
+    if (S !== scan) return;
+    S.extraction = { status: 'done', bottles: menu ? demoMenuBottles() : demoBottles(), storeHint: menu ? 'Bistro Demo' : null, photoKind: menu ? 'menu' : 'shelf', error: null, usage: null };
     if (screen === 'prefs') render();
     if (S.prefsSubmitted) runLookup();
   }, 1600);
@@ -737,18 +1054,44 @@ const actions = {
   home: () => { closeSheet(); refreshHome(); go('home'); },
   settings: () => go('settings'),
   history: async () => {
-    historyData = { scans: await db.allScans(), wines: await db.allWines() };
+    historyData = { scans: await db.allScans(), wines: await db.allWines(), places: await db.allPlaces() };
     go('history');
   },
   htab: (el) => { historyTab = el.dataset.v; render(); },
-  demo: startDemo,
-  'take-photo': () => {
-    if (screen !== 'capture') { S = fresh(); }
+  demo: (el) => startDemo(el.dataset.domain || 'retail'),
+  'take-photo': (el) => {
+    if (screen !== 'capture') { S = fresh(el.dataset.domain || 'retail'); }
     pickFiles();
   },
-  'pick-photo': () => {
-    if (screen !== 'capture') { S = fresh(); }
+  'pick-photo': (el) => {
+    if (screen !== 'capture') { S = fresh(el.dataset.domain || 'retail'); }
     pickFiles(true);
+  },
+  'switch-domain': (el) => {
+    // Same photos, other domain: re-read with the right prompt, keep the location fix.
+    const photos = S.photos, pos = S.geo.pos, demo = S.demo;
+    if (demo) return startDemo(el.dataset.domain);
+    S = fresh(el.dataset.domain);
+    S.photos = photos;
+    if (pos) { S.geo.pos = pos; S.geo.status = 'searching'; relocateFrom(pos); }
+    else S.geo.status = settings.saveLocation ? 'nofix' : 'off';
+    go('prefs');
+    runExtraction();
+  },
+  'place-sheet': () => placeSheet(),
+  'choose-place': (el) => {
+    const p = S.geo.candidates.find((c) => c.id === el.dataset.id);
+    if (!p) return;
+    S.geo.place = p; S.geo.chosenBy = 'user';
+    render(); placeChanged();
+  },
+  'place-none': () => { S.geo.place = null; S.geo.chosenBy = 'user'; render(); placeChanged(); },
+  'retry-locate': () => { S.geo = { ...freshGeo(), place: S.geo.place, chosenBy: S.geo.chosenBy }; startLocate(null, false); },
+  'place-detail': (el) => placeDetailSheet(el.dataset.id),
+  'forget-place': async (el) => {
+    await db.deletePlace(el.dataset.id);
+    historyData.places = historyData.places.filter((p) => p.id !== el.dataset.id);
+    closeSheet(); render(); toast('Place removed (prices you saw are kept)');
   },
   'remove-photo': (el) => { S.photos.splice(+el.dataset.i, 1); S.photos.length ? render() : go('home'); },
   analyze: () => {
@@ -775,25 +1118,23 @@ const actions = {
     else render();
   },
   'edit-prefs': () => { S.prefsSubmitted = false; go('prefs'); },
-  'new-scan': () => { S = fresh(); pickFiles(); },
+  'new-scan': (el) => { S = fresh(el.dataset.domain || S.domain); pickFiles(); },
   sort: (el) => { sortBy = el.dataset.v; render(); },
   'show-shelf': (el) => shelfSheet(+el.dataset.idx),
-  details: (el) => {
+  details: async (el) => {
     const b = S.extraction.bottles.find((x) => x.idx === +el.dataset.idx);
-    detailsSheet(b, S.lookup.infoByKey[wineKey(b)] || null);
+    const seen = S.demo ? '' : await seenPricesHtml(wineKey(b), S.domain, S.scanId);
+    detailsSheet(b, S.lookup.infoByKey[wineKey(b)] || null, seen);
   },
   'wine-detail': async (el) => {
     const w = historyData.wines.find((x) => x.key === el.dataset.key);
-    const obs = await db.observationsFor(w.key);
-    const note = obs.length
-      ? `<h2 class="section-title">Prices you saw</h2><ul class="sources">${obs.sort((a, b) => b.at - a.at).slice(0, 8).map((o) => `<li>${lei(o.price)} lei${o.promo ? ' (promo)' : ''} · ${new Date(o.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}${o.store ? ' · ' + esc(o.store) : ''}</li>`).join('')}</ul>`
-      : '';
-    detailsSheet(null, { ...w.info, matched_name: w.info.matched_name || w.label }, note + `<button class="btn ghost" style="width:100%;margin-top:10px" data-action="forget-wine" data-key="${esc(w.key)}">Remove from wine list</button>`);
+    const note = await seenPricesHtml(w.wineKey, w.domain);
+    detailsSheet(null, { ...w.info, matched_name: w.info.matched_name || w.label }, note + `<button class="btn ghost" style="width:100%;margin-top:10px" data-action="forget-wine" data-key="${esc(w.key)}">Remove from saved wines</button>`, w.domain);
   },
   'forget-wine': async (el) => {
     await db.deleteWine(el.dataset.key);
     historyData.wines = historyData.wines.filter((w) => w.key !== el.dataset.key);
-    closeSheet(); render(); toast('Removed from your wine list');
+    closeSheet(); render(); toast('Removed from saved wines');
   },
   fix: (el) => fixSheet(+el.dataset.idx),
   'close-sheet': (el, ev) => { if (ev.target === el) dismissSheet(); },
@@ -817,7 +1158,7 @@ const actions = {
     a.href = URL.createObjectURL(blob); a.download = file.name; a.click();
   },
   'clear-data': async () => {
-    if (!confirm('Delete all saved wines, prices and scans from this phone?')) return;
+    if (!confirm('Delete all saved wines, prices, places and scans from this phone?')) return;
     await db.clearAll(); toast('All saved data deleted');
   },
 };
@@ -828,7 +1169,7 @@ document.addEventListener('click', (ev) => {
   const fn = actions[el.dataset.action];
   if (!fn) return;
   if (el.dataset.action !== 'close-sheet') ev.preventDefault();
-  if (el.closest('.sheet') && !['close-sheet', 'dismiss-sheet', 'forget-wine', 'fix'].includes(el.dataset.action)) closeSheet();
+  if (el.closest('.sheet') && !['close-sheet', 'dismiss-sheet', 'forget-wine', 'forget-place', 'fix'].includes(el.dataset.action)) closeSheet();
   if (el.dataset.action === 'fix') closeSheet();
   fn(el, ev);
 });
@@ -840,8 +1181,12 @@ document.addEventListener('input', (ev) => {
     S.prefs[el.dataset.input] = v === '' || isNaN(+v) ? null : +v;
     // Light re-render: update only the counter and button.
     const n = countMatching();
-    const hint = $app.querySelector('.page > p.hint');
-    if (hint && n != null) hint.textContent = `${n} wine${n === 1 ? '' : 's'} on this shelf match${n === 1 ? 'es' : ''} your type and price.`;
+    if (n != null) {
+      const h = $app.querySelector('[data-count]');
+      if (h) h.textContent = matchText(n);
+      const btn = $app.querySelector('[data-action="submit-prefs"]');
+      if (btn) btn.disabled = n === 0 || S.prefs.types.length === 0;
+    }
     $app.querySelectorAll('[data-action="preset"]').forEach((b) => b.setAttribute('aria-pressed', 'false'));
   }
 });
@@ -863,6 +1208,15 @@ document.addEventListener('change', async (ev) => {
 
 document.addEventListener('submit', async (ev) => {
   const form = ev.target;
+  if (form.dataset.form === 'place') {
+    ev.preventDefault();
+    const name = String(new FormData(form).get('name') || '').trim();
+    if (!name) return toast(`Type the ${C().placeWord} name`);
+    S.geo.place = manualPlace(name);
+    S.geo.chosenBy = 'user';
+    closeSheet(); render(); placeChanged();
+    return;
+  }
   if (form.dataset.form !== 'fix') return;
   ev.preventDefault();
   const b = S.extraction.bottles.find((x) => x.idx === +form.dataset.idx);
@@ -873,9 +1227,14 @@ document.addEventListener('submit', async (ev) => {
   b.color = fd.get('color');
   const price = parseFloat(String(fd.get('price')).replace(',', '.'));
   if (!isNaN(price)) { b.promo_price = null; b.shelf_price = price; }
+  else if (String(fd.get('price') ?? '').trim() === '') { b.shelf_price = null; }
+  if (fd.has('glass')) {
+    const g = parseFloat(String(fd.get('glass')).replace(',', '.'));
+    b.glass_price = isNaN(g) ? null : g;
+  }
   b.confidence = 1;
   closeSheet();
-  if (S.demo) { toast('Corrections are not looked up in the demo'); S.results = recommend(currentCandidates(), S.lookup.infoByKey, S.prefs, { EUR: settings.eurRon }, 3); return render(); }
+  if (S.demo) { toast('Corrections are not looked up in the demo'); S.results = rank(currentCandidates()); return render(); }
   runLookup([wineKey(b)]);
 });
 
@@ -891,4 +1250,4 @@ render();
 refreshHome();
 
 // Exposed for automated tests only.
-window.__oeno = { get state() { return S; }, get screen() { return screen; }, actions };
+window.__oeno = { get state() { return S; }, get screen() { return screen; }, actions, db };

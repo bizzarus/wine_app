@@ -12,6 +12,8 @@
   --promo: #c4303a;
   --good: #1f7a4d;
   --red: #7a1f2e; --white: #d9cf8e; --rose: #e8a1a1; --sparkling: #bfe0d0; --other: #b48a4a;
+  --on-chrome-muted: #a9c2b8;
+  --cellar: #3b1520;     /* restaurant domain chrome */
   --font: 'Archivo', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
   --safe-b: env(safe-area-inset-bottom, 0px);
   --safe-t: env(safe-area-inset-top, 0px);
@@ -45,7 +47,7 @@ a { color: var(--glass-3); }
   margin: 0; flex: 1;
   font-size: 22px; font-weight: 800; font-stretch: 115%; letter-spacing: -0.01em;
 }
-.top .sub { font-size: 14px; color: #a9c2b8; font-weight: 400; font-stretch: 100%; display: block; }
+.top .sub { font-size: 14px; color: var(--on-chrome-muted); font-weight: 400; font-stretch: 100%; display: block; }
 .icon-btn {
   width: 44px; height: 44px; border-radius: 22px; border: 0;
   background: var(--glass-2); color: var(--paper);
@@ -96,7 +98,7 @@ a { color: var(--glass-3); }
 .hero-scan .bottles i::before { content: ''; position: absolute; left: 7px; top: -18px; width: 8px; height: 20px; background: inherit; border-radius: 3px 3px 0 0; }
 .hero-scan .shelf-edge { height: 8px; background: var(--glass-3); border-radius: 2px; margin: -12px -4px 18px; }
 .hero-scan strong { display: block; font-size: 28px; font-weight: 800; font-stretch: 112%; line-height: 1.1; }
-.hero-scan span { color: #a9c2b8; font-size: 15px; }
+.hero-scan span { color: var(--on-chrome-muted); font-size: 15px; }
 .stats { display: flex; gap: 18px; margin: 18px 2px 0; color: var(--muted); font-size: 15px; }
 .stats b { color: var(--ink); font-size: 20px; display: block; font-stretch: 110%; }
 .notice {
@@ -310,3 +312,83 @@ body.sheet-open { overflow: hidden; }
 .notice .link-btn { padding: 0; }
 .progress-card > svg { width: 30px; height: 30px; flex: 0 0 auto; }
 .sortbar .chip { white-space: nowrap; flex: 0 0 auto; }
+
+/* ================================================================ restaurant domain */
+/* Restaurant screens re-skin the chrome in cellar burgundy, so shop and restaurant
+   prices are never mistaken for each other. */
+body.horeca {
+  --glass: #3b1520;
+  --glass-2: #52202d;
+  --glass-3: #7d3a4a;
+  --on-chrome-muted: #e0b9c1;
+}
+.muted-on-chrome { color: var(--on-chrome-muted); font-size: 14px; }
+
+.hero-scan + .hero-scan { margin-top: 12px; }
+.hero-scan.menu { background: var(--cellar); }
+.hero-scan.menu span { color: #e0b9c1; }
+.menu-lines { display: grid; gap: 10px; margin: 2px 0 20px; padding: 14px 16px; background: #f6f0e4; border-radius: 10px; }
+.menu-lines i { display: flex; align-items: center; gap: 8px; }
+.menu-lines b { height: 9px; border-radius: 3px; background: #7d3a4a; opacity: .75; flex: 0 0 auto; }
+.menu-lines u { flex: 1; border-bottom: 2px dotted #c9a9b0; transform: translateY(2px); }
+.menu-lines em { font-style: normal; font-weight: 800; color: #3b1520; font-size: 15px; }
+
+.stats { flex-wrap: wrap; }
+
+.badge {
+  display: inline-block; font-size: 12px; font-weight: 700; line-height: 1;
+  padding: 3px 7px 4px; border-radius: 6px; vertical-align: 1px;
+}
+.badge.retail { background: #dfeadf; color: #1f4b3e; }
+.badge.horeca { background: #f1dde1; color: #5a1f2d; }
+.badge.known { background: var(--paper-2); color: var(--muted); }
+
+.domain-strip {
+  display: flex; gap: 10px; align-items: flex-start; font-size: 14px;
+  background: #f6eef0; border: 1.5px solid #e3c6cd; color: #4a1c27;
+  border-radius: 12px; padding: 10px 12px; margin-bottom: 14px;
+}
+.domain-strip svg { width: 20px; height: 20px; flex: 0 0 auto; margin-top: 1px; }
+
+/* the price tag becomes a wine-list line in restaurants */
+.tag.menu {
+  background: #f6f0e4; color: #2a1016; box-shadow: none;
+  border: 1.5px solid #d9c3a6; border-left: 6px solid var(--glass-3);
+}
+.tag.menu .price .n { font-stretch: 85%; }
+.tag.menu .was { color: #6b4b52; font-weight: 500; }
+.tag.menu .delta { background: var(--glass-3); }
+.tag.menu .delta.even { background: #8a7a6e; }
+.tag.menu .delta.dear { background: #4a4a44; }
+.tag.menu .delta:not(.even):not(.dear) { background: #1f7a4d; }
+
+.shelf-view.menu { background: #f6f0e4; }
+.shelf-view.menu .box { border-radius: 4px; }
+
+.all-table small { color: var(--muted); font-weight: 400; }
+
+/* ================================================================ places */
+.place-card {
+  width: 100%; display: flex; align-items: center; gap: 12px; text-align: left;
+  background: #fff; border: 1.5px solid var(--line); border-radius: 14px;
+  padding: 10px 12px; margin-bottom: 16px; cursor: pointer; min-height: 56px;
+}
+.place-card.busy { cursor: default; color: var(--muted); }
+.place-card.ask { border-color: #e9d16a; background: #fffbea; }
+.place-card .grow { flex: 1; min-width: 0; }
+.place-card b { display: block; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.place-card .grow > span { display: block; font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-pin { width: 32px; height: 32px; border-radius: 16px; display: grid; place-items: center; background: var(--paper-2); color: var(--glass-3); flex: 0 0 auto; }
+.pc-pin svg { width: 18px; height: 18px; }
+.pc-btn { font-weight: 700; color: var(--glass-3); font-size: 15px; flex: 0 0 auto; }
+.spinner.small { width: 18px; height: 18px; border-width: 2px; border-color: var(--line); border-top-color: var(--glass); }
+
+.place-list .row { padding: 12px 2px; }
+.place-list .sel { width: 26px; height: 26px; color: var(--good); flex: 0 0 auto; }
+.place-list .sel svg { width: 22px; height: 22px; }
+.pin-dot { width: 40px; height: 40px; border-radius: 20px; display: grid; place-items: center; flex: 0 0 auto; }
+.pin-dot svg { width: 20px; height: 20px; }
+.pin-dot.retail { background: #dfeadf; color: #1f4b3e; }
+.pin-dot.horeca { background: #f1dde1; color: #5a1f2d; }
+/* on a wine list the rank sits above the line so it never covers the wine's name */
+.shelf-view.menu .box .lbl { top: auto; bottom: 100%; left: -3px; border-radius: 6px 6px 0 0; padding: 1px 8px; }

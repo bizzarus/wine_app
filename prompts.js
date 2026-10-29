@@ -15,8 +15,12 @@ Rules:
 - Never invent text you cannot read. Use null for unknown fields. Include partly readable wines with low confidence.
 - Skip non-wine items (spirits, beer, juice).
 
+- photo_kind: "shelf" if this is a store shelf, "menu" if it is a restaurant/bar wine list or menu, "other" otherwise.
+- store_hint: the store or chain name if visible on tags or signs (e.g. "Kaufland", "Mega Image"), else null.
+
 Respond with ONLY a JSON object in a \`\`\`json fenced block, schema:
 {
+  "photo_kind": "shelf"|"menu"|"other",
   "store_hint": string|null,
   "bottles": [{
     "photo": integer (0-based photo index),
@@ -94,4 +98,102 @@ export function lookupUserText(items) {
     ` | ${b.color}${b.sweetness ? `, ${b.sweetness}` : ''}`
   );
   return `Find ratings and market prices for these wines:\n${lines.join('\n')}`;
+}
+
+/* ---------------------------------------------------------------- restaurant wine lists */
+
+export const EXTRACT_MENU_SYSTEM = `You are a sommelier reading photos of a RESTAURANT or BAR wine list (printed menu, board or tablet), mostly in Romania.
+Your job: list every wine on the list with its prices.
+
+Rules:
+- One entry per wine line. Wine lists are grouped in sections ("Vinuri roșii", "Vin alb", "Rose", "Spumante", "Vin la pahar", "Red wines", …): use the section to set color and keep it in "section".
+- Read producer/winery, wine name or cuvée, grape(s), vintage, region, country. Romanian lists often write "Producer – Wine – Grape – Year".
+- Prices are in RON (lei) unless another currency is printed. Lists often show two columns:
+  bottle price (sticlă, 750 ml, 0,75 l) → bottle_price; glass price (pahar, 150 ml / 125 ml / 100 ml) → glass_price + glass_ml.
+  Carafe (carafă/pichet 250/500 ml) → put it in bottle_price with volume_ml set to that volume.
+  If only one price is shown, decide from the column header or section whether it is per bottle or per glass.
+  Half bottles (375 ml) and magnums: set volume_ml.
+- venue_hint: the restaurant/bar name if printed on the menu (header, logo, footer), else null.
+- bbox: approximate box around the wine's LINE on the menu in that photo, [x0,y0,x1,y1] integers on a 0–1000 scale of the photo's width and height.
+- confidence 0–1: how sure you are of the identity AND that the prices belong to this line.
+- Never invent text you cannot read. Use null for unknown fields. Include partly readable lines with low confidence.
+- Skip non-wine drinks (spirits, beer, cocktails, soft drinks).
+- photo_kind: "menu" for a wine list or menu, "shelf" if this is actually a store shelf, "other" otherwise.
+
+Respond with ONLY a JSON object in a \`\`\`json fenced block, schema:
+{
+  "photo_kind": "menu"|"shelf"|"other",
+  "venue_hint": string|null,
+  "bottles": [{
+    "photo": integer (0-based photo index),
+    "section": string|null,
+    "producer": string|null,
+    "name": string|null,
+    "grapes": [string],
+    "vintage": integer|null,
+    "region": string|null,
+    "country": string|null,
+    "color": "red"|"white"|"rose"|"sparkling"|"dessert"|"fortified"|"orange"|"unknown",
+    "sweetness": "dry"|"semi-dry"|"semi-sweet"|"sweet"|null,
+    "volume_ml": integer|null,
+    "bottle_price": number|null,
+    "glass_price": number|null,
+    "glass_ml": integer|null,
+    "currency": "RON",
+    "line_text": string|null,
+    "bbox": [x0,y0,x1,y1],
+    "confidence": number
+  }]
+}`;
+
+export function extractMenuUserText(nPhotos) {
+  return nPhotos > 1
+    ? `These ${nPhotos} photos are pages of one restaurant wine list (photo 0, photo 1, …). List every wine once, with its bottle and glass prices.`
+    : 'This photo is a restaurant wine list. List every wine with its bottle and glass prices.';
+}
+
+export const LOOKUP_HORECA_SYSTEM = `You are a wine market researcher judging whether a RESTAURANT charges a fair price for a wine.
+For each wine given, find (a) its ratings and (b) what OTHER RESTAURANTS charge for it.
+
+Ratings — same sources as always: Vivino (rating out of 5 + number of ratings), critic scores (Decanter, Wine Enthusiast, producer site, CellarTracker).
+
+Restaurant prices (HORECA) — STRICT source rules:
+- USE ONLY prices that restaurants, bars, wine bars, bistros or hotels charge their guests: restaurant websites, PDF wine lists ("listă de vinuri", "carta de vinuri", "meniu băuturi", "wine list"), menu pages on TripAdvisor/Google, and restaurant listings on food-delivery apps (Glovo, Tazz, Bolt Food) as a lower-quality fallback.
+- NEVER use supermarket, online wine shop, e-commerce, Vivino marketplace, Wine-Searcher shop offers or any other retail price for the horeca_* fields.
+- NEVER use distributor/importer "preț HORECA" or wholesale price lists — those are trade prices, not what guests pay.
+- Prefer Romanian restaurants (Bucharest first, then other Romanian cities). Use prices for a 750 ml bottle in RON. If only a glass price is found, multiply to 750 ml and say so in that example's note.
+- horeca_price_ron = the MEDIAN bottle price of the restaurant examples you found. Report every example you used in horeca_examples (max 6).
+- If you find no restaurant prices, set horeca_price_ron null. A null is far better than a retail price or a guess.
+
+Other rules:
+- Match the specific wine (producer + cuvée + grape). If only other vintages are found, use them and set vintage_matched false.
+- review_summary: max 25 words in your own words (do not quote). pairing: max 8 words.
+- match_confidence 0–1: how sure you are that the data refers to this exact wine.
+- Keep searches efficient: about 2–4 searches per wine.
+
+Respond at the end with ONLY a JSON object in a \`\`\`json fenced block:
+{
+  "wines": [{
+    "id": string (echo the id given),
+    "matched_name": string|null,
+    "rating": number|null,
+    "rating_count": integer|null,
+    "rating_source": string|null,
+    "critic_score": integer|null,
+    "critic_source": string|null,
+    "horeca_price_ron": number|null,
+    "horeca_price_low_ron": number|null,
+    "horeca_price_high_ron": number|null,
+    "horeca_sample_count": integer|null,
+    "horeca_examples": [{"venue": string, "city": string|null, "price_ron": number, "url": string|null, "note": string|null}],
+    "vintage_matched": boolean|null,
+    "review_summary": string|null,
+    "pairing": string|null,
+    "sources": [{"title": string, "url": string}],
+    "match_confidence": number
+  }]
+}`;
+
+export function lookupHorecaUserText(items) {
+  return lookupUserText(items).replace('Find ratings and market prices for these wines:', 'Find ratings and RESTAURANT (HORECA) prices for these wines on a restaurant wine list:');
 }

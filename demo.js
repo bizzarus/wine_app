@@ -76,3 +76,73 @@ export function demoInfo() {
   });
   return out;
 }
+
+/* ---------------------------------------------------------------- demo wine list (restaurant) */
+
+const MW = 1000, MH = 1400;
+// [section, producer, name, vintage, color, bottle, glass, info]
+const MENU = [
+  ['Vinuri roșii', 'Dealul Lupului', 'Fetească Neagră', 2021, 'red', 145, 32, { rating: 3.9, rating_count: 1200, horeca_price_ron: 175, horeca_sample_count: 5, horeca_price_low_ron: 150, horeca_price_high_ron: 210 }],
+  ['Vinuri roșii', 'Valea Pietrei', 'Cabernet Sauvignon Reserve', 2020, 'red', 260, null, { rating: 4.1, rating_count: 640, critic_score: 90, critic_source: 'Demo Wine Guide', horeca_price_ron: 230, horeca_sample_count: 3 }],
+  ['Vinuri roșii', 'Podgoria Siret', 'Băbească Neagră', 2022, 'red', null, 28, { rating: 3.7, rating_count: 310, horeca_price_ron: 120, horeca_sample_count: 2 }],
+  ['Vinuri roșii', 'Casa Brumar', 'Merlot Clasic', null, 'red', 95, 22, { rating: 3.4, rating_count: 2100, horeca_price_ron: 110, horeca_sample_count: 6 }],
+  ['Vinuri albe', 'Conacul Alb', 'Sauvignon Blanc', 2023, 'white', 135, 30, { rating: 3.8, rating_count: 900, horeca_price_ron: 160, horeca_sample_count: 4 }],
+  ['Vinuri albe', 'Weingut Feldbach', 'Riesling Trocken', 2022, 'white', 210, null, { rating: 3.9, rating_count: 1800, critic_score: 89, critic_source: 'Demo Wine Guide', horeca_price_ron: null, horeca_sample_count: null }],
+  ['Rose & spumante', 'Casa Brumar', 'Rosé de Drăgășani', 2023, 'rose', 110, 25, { rating: 3.5, rating_count: 300, horeca_price_ron: 115, horeca_sample_count: 3 }],
+  ['Rose & spumante', 'Bollicine di Treviso', 'Prosecco DOC Extra Dry', null, 'sparkling', 150, 30, { rating: 3.7, rating_count: 5000, horeca_price_ron: 140, horeca_sample_count: 7 }],
+];
+
+const xml = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&apos;');
+
+const lineY = (i) => {
+  const sectionsBefore = new Set(MENU.slice(0, i + 1).map((m) => m[0])).size;
+  return 210 + i * 118 + sectionsBefore * 70;
+};
+
+export function demoMenuDataUrl() {
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${MW} ${MH}" width="${MW}" height="${MH}">
+    <rect width="${MW}" height="${MH}" fill="#f6f0e4"/>
+    <rect x="30" y="30" width="${MW - 60}" height="${MH - 60}" fill="none" stroke="#7a3346" stroke-width="3"/>
+    <text x="${MW / 2}" y="110" font-size="46" text-anchor="middle" fill="#3b1520" font-family="Georgia" font-style="italic">Bistro Demo</text>
+    <text x="${MW / 2}" y="160" font-size="22" text-anchor="middle" fill="#7a3346" font-family="Georgia" letter-spacing="6">LISTA DE VINURI · FICTIONAL</text>
+    <text x="760" y="215" font-size="18" text-anchor="middle" fill="#7a3346" font-family="Georgia">pahar 150 ml</text>
+    <text x="900" y="215" font-size="18" text-anchor="middle" fill="#7a3346" font-family="Georgia">sticlă 750 ml</text>`;
+  let lastSection = null;
+  MENU.forEach((m, i) => {
+    const y = lineY(i);
+    if (m[0] !== lastSection) { s += `<text x="80" y="${y - 52}" font-size="28" fill="#7a3346" font-family="Georgia" font-weight="bold">${xml(m[0])}</text>`; lastSection = m[0]; }
+    s += `<text x="80" y="${y}" font-size="26" fill="#222" font-family="Georgia">${xml(`${m[1]} — ${m[2]}${m[3] ? ' ' + m[3] : ''}`)}</text>
+      <text x="80" y="${y + 32}" font-size="18" fill="#777" font-family="Georgia" font-style="italic">${m[4] === 'red' ? 'sec, roșu' : m[4] === 'white' ? 'sec, alb' : m[4] === 'rose' ? 'sec, rose' : 'spumant'}</text>
+      <text x="760" y="${y}" font-size="26" text-anchor="middle" fill="#222" font-family="Georgia">${m[6] ?? '—'}</text>
+      <text x="900" y="${y}" font-size="26" text-anchor="middle" fill="#222" font-family="Georgia">${m[5] ?? '—'}</text>`;
+  });
+  s += '</svg>';
+  return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(s);
+}
+
+export function demoMenuBottles() {
+  return MENU.map((m, i) => {
+    const y = lineY(i);
+    return {
+      idx: i, photo: 0, section: m[0], producer: m[1], name: m[2], grapes: [], vintage: m[3], region: null, country: null,
+      color: m[4], sweetness: 'dry', volume_ml: 750, shelf_price: m[5], promo_price: null,
+      glass_price: m[6], glass_ml: m[6] ? 150 : null, price_tag_text: null, facings: 1,
+      bbox: [60, Math.round((y - 34) / MH * 1000), 950, Math.round((y + 44) / MH * 1000)],
+      confidence: 0.9,
+    };
+  });
+}
+
+export function demoMenuInfo() {
+  const out = {};
+  MENU.forEach((m) => {
+    const key = wineKey({ producer: m[1], name: m[2], vintage: m[3] });
+    out[key] = {
+      domain: 'horeca', matched_name: `${m[1]} ${m[2]}`, rating_source: 'Demo data', vintage_matched: true,
+      critic_score: null, critic_source: null, review_summary: null, pairing: null,
+      horeca_examples: m[7].horeca_price_ron ? [{ venue: 'Demo Restaurant A', city: 'București', price_ron: m[7].horeca_price_ron, url: null, note: null }] : [],
+      sources: [], citations: [], match_confidence: 0.9, ...m[7],
+    };
+  });
+  return out;
+}
